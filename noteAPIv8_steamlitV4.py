@@ -28,7 +28,7 @@ load_dotenv()
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # =========================================================================
-# 1. データベース接続・環境判別・初期化
+# 1. データベース接続・初期化
 # =========================================================================
 def get_db_info():
     db_url = os.getenv("DATABASE_URL")
@@ -257,6 +257,8 @@ def main():
             data = get_articles(s, uid)
             if data: save_data(data, "note_data"); st.rerun()
         else: st.sidebar.error("noteの認証に失敗しました。")
+    # ここに注釈を追加
+    st.sidebar.caption("※ ボタンを押すと現在のデータが保存されます。日々の推移を記録するため、1日1回の実行をお勧めします。")
 
     try:
         conn = get_connection(); q = "SELECT * FROM article_stats WHERE user_id = %s" if db_type == "postgres" else "SELECT * FROM article_stats WHERE user_id = ?"
@@ -277,6 +279,9 @@ def main():
         if has_prev:
             st.subheader("📈 全体累計ビュー推移")
             tv = df_all.groupby('acquired_at')['views'].sum().reset_index(); fig = px.line(tv, x='acquired_at', y='views'); fig.update_layout(xaxis_type='date', yaxis=dict(tickformat=',d', rangemode='tozero')); st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("📉 推移グラフを表示するには、2日分以上のデータが必要です。明日また最新データを取得してください。")
+
         t1, t2, t3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
         with t1:
             fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h', text_auto=True); fig.update_layout(yaxis={'autorange': 'reversed'}, height=600); st.plotly_chart(fig, use_container_width=True)
