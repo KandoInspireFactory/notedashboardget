@@ -230,9 +230,12 @@ def main():
     st.sidebar.header("🔑 設定")
     if st.session_state.app_user_email:
         st.sidebar.info(f"👤 {st.session_state.app_user_email}")
-        if st.sidebar.button("ログアウト"): st.session_state.app_auth_token=None; st.session_state.app_user_email=None; st.rerun()
+        if st.sidebar.button("ログアウト"):
+            st.session_state.app_auth_token=None
+            st.session_state.app_user_email=None
+            st.rerun()
 
-    menu = ["ダッシュボード"]; 
+    menu = ["ダッシュボード "]; 
     if is_admin: menu.append("🛠️ ユーザー管理")
     choice = st.sidebar.radio("メニュー", menu)
 
