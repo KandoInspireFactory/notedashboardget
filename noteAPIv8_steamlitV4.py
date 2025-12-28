@@ -42,14 +42,27 @@ def get_connection():
     else:
         return sqlite3.connect(db_target)
 
+def get_neon_api_url(endpoint):
+    """
+    環境変数 NEON_DATA_API_URL を元に正しいAPIエンドポイントを構築する。
+    末尾の /v1 などの重複を防止する。
+    """
+    base_url = os.getenv("NEON_DATA_API_URL", "").rstrip("/")
+    # base_urlが /v1 で終わっている場合は、それを除去して構築
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    
+    return f"{base_url}/v1/rpc/{endpoint}"
+
 def neon_auth_login(email, password):
     """Neon Data APIを使用してログイン認証を行う"""
-    data_api_url = os.getenv("NEON_DATA_API_URL")
     api_key = os.getenv("NEON_API_KEY")
-    if not data_api_url or not api_key: return True, "local"
+    url = get_neon_api_url("sign_in")
+    
+    if not api_key: return True, "local"
     try:
         response = requests.post(
-            f"{data_api_url}/v1/rpc/sign_in",
+            url,
             headers={"Authorization": f"Bearer {api_key}"},
             json={"email": email, "password": password},
             timeout=10
@@ -60,28 +73,37 @@ def neon_auth_login(email, password):
                 return False, res_data.get("message", "ログイン失敗")
             return True, res_data.get("token", "logged_in")
         else:
-            return False, "ログイン失敗: メールアドレスまたはパスワードが正しくありません。"
+            return False, f"ログイン失敗 ({response.status_code}): {response.text}"
     except Exception as e:
         return False, f"認証エラー: {str(e)}"
 
 def neon_auth_signup(email, password):
     """Neon Data APIを使用して新規ユーザー登録を行う"""
-    data_api_url = os.getenv("NEON_DATA_API_URL")
     api_key = os.getenv("NEON_API_KEY")
+    url = get_neon_api_url("sign_up")
+    
     try:
         response = requests.post(
-            f"{data_api_url}/v1/rpc/sign_up",
+            url,
             headers={"Authorization": f"Bearer {api_key}"},
             json={"email": email, "password": password},
             timeout=10
         )
-        res_data = response.json()
-        if response.status_code == 200 and res_data.get("status") == "success":
-            return True, "登録が完了しました。ログインしてください。"
+        if response.status_code == 200:
+            res_data = response.json()
+            if res_data.get("status") == "success":
+                return True, "登録が完了しました。ログインタブからログインしてください。"
+            else:
+                return False, res_data.get("message", "登録に失敗しました。")
         else:
-            return False, res_data.get("message", "登録に失敗しました。")
+            # エラーの詳細を解析
+            try:
+                err_msg = response.json().get("message", response.text)
+            except:
+                err_msg = response.text
+            return False, f"登録エラー ({response.status_code}): {err_msg}"
     except Exception as e:
-        return False, f"登録エラー: {str(e)}"
+        return False, f"通信エラー: {str(e)}"
 
 # --- 管理者専用機能 ---
 def admin_get_all_users():
