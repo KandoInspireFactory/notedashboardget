@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -9,24 +9,30 @@ myenv/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
-# SQLite Databases
+# SQLite Databases (Local historical data)
+note_dashboard.db
+note_data/
 
 # Logs
 logs/
 *.log
 
-# Archives (Excluded from GitHub)
+# Graphics and Outputs
+plots/
+plots_v9/
 archive/
 csv_archive/
-plots/
 
 # Temporary Check Files
 check_encoding.txt
 db_inspection_result.txt
 
-# Streamlit (Security: secrets.toml included in this folder)
+# Streamlit
 .streamlit/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# SQL (Keep setup scripts, ignore actual data backups if any)
+# sql/setup_neon_auth.sql は雛形なので含める
