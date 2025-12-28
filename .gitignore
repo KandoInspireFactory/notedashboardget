@@ -1,0 +1,32 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+myenv/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# SQLite Databases
+
+# Logs
+logs/
+*.log
+
+# Archives (Excluded from GitHub)
+archive/
+csv_archive/
+plots/
+
+# Temporary Check Files
+check_encoding.txt
+db_inspection_result.txt
+
+# Streamlit (Security: secrets.toml included in this folder)
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
