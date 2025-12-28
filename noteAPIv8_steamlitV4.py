@@ -42,79 +42,49 @@ def get_connection():
     else:
         return sqlite3.connect(db_target)
 
-def get_neon_api_url(endpoint):
-    """
-    環境変数 NEON_DATA_API_URL を元に正しいAPIエンドポイントを構築する。
-    """
-    base_url = os.getenv("NEON_DATA_API_URL", "").rstrip("/")
-    # 既に /rpc が含まれている場合は endpoint を足さない
-    if "/rpc/" in base_url:
-        return base_url
-    return f"{base_url}/rpc/{endpoint}"
-
 def neon_auth_login(email, password):
-    """Neon Data APIを使用してログイン認証を行う"""
-    api_key = os.getenv("NEON_API_KEY")
-    url = get_neon_api_url("sign_in")
+    """直接DB接続を使用してログイン認証を行う"""
+    db_type, _ = get_db_info()
+    if db_type != "postgres": return True, "local"
     
-    if not api_key: return True, "local"
     try:
-        # Authorizationヘッダーではなく Neon-Api-Key ヘッダーを使用する
-        headers = {
-            "Neon-Api-Key": api_key,
-            "Content-Type": "application/json"
-        }
-        response = requests.post(
-            url,
-            headers=headers,
-            json={"email": email, "password": password},
-            timeout=10
-        )
-        if response.status_code == 200:
-            res_data = response.json()
-            if isinstance(res_data, dict) and res_data.get("status") == "error":
-                return False, res_data.get("message", "ログイン失敗")
-            return True, res_data.get("token", "logged_in")
+        conn = get_connection()
+        cursor = conn.cursor()
+        # パスワード照合SQL
+        query = "SELECT email FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
+        cursor.execute(query, (email, password))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return True, "logged_in"
         else:
-            return False, f"ログイン失敗 ({response.status_code}): {response.text}"
+            return False, "メールアドレスまたはパスワードが正しくありません。"
     except Exception as e:
         return False, f"認証エラー: {str(e)}"
 
 def neon_auth_signup(email, password):
-    """Neon Data APIを使用して新規ユーザー登録を行う"""
-    api_key = os.getenv("NEON_API_KEY")
-    url = get_neon_api_url("sign_up")
+    """直接DB接続を使用して新規ユーザー登録を行う"""
+    db_type, _ = get_db_info()
+    if db_type != "postgres": return False, "ローカルモードでは新規登録できません。"
     
     try:
-        # Authorizationヘッダーではなく Neon-Api-Key ヘッダーを使用する
-        headers = {
-            "Neon-Api-Key": api_key,
-            "Content-Type": "application/json"
-        }
-        response = requests.post(
-            url,
-            headers=headers,
-            json={"email": email, "password": password},
-            timeout=10
-        )
-        if response.status_code == 200:
-            res_data = response.json()
-            # 戻り値がリスト形式で返ってくる場合があるため対応
-            if isinstance(res_data, list) and len(res_data) > 0:
-                res_data = res_data[0]
-                
-            if res_data.get("status") == "success":
-                return True, "登録が完了しました。ログインタブからログインしてください。"
-            else:
-                return False, res_data.get("message", "登録に失敗しました。")
-        else:
-            try:
-                err_msg = response.json().get("message", response.text)
-            except:
-                err_msg = response.text
-            return False, f"登録エラー ({response.status_code}): {err_msg}"
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # 重複チェック
+        cursor.execute("SELECT 1 FROM app_users WHERE email = %s", (email,))
+        if cursor.fetchone():
+            conn.close()
+            return False, "このメールアドレスは既に登録されています。"
+        
+        # 登録実行
+        cursor.execute("INSERT INTO app_users (email, password_hash) VALUES (%s, crypt(%s, gen_salt('bf')))", (email, password))
+        conn.commit()
+        conn.close()
+        return True, "登録が完了しました。ログインタブからログインしてください。"
     except Exception as e:
-        return False, f"通信エラー: {str(e)}"
+        return False, f"登録エラー: {str(e)}"
 
 # --- 管理者専用機能 ---
 def admin_get_all_users():
@@ -242,7 +212,7 @@ def main():
     if "app_user_email" not in st.session_state: st.session_state.app_user_email = None
 
     # --- アプリログイン（Neon Auth） ---
-    if db_type == "postgres" and os.getenv("NEON_API_KEY") and not st.session_state.app_auth_token:
+    if db_type == "postgres" and not st.session_state.app_auth_token:
         st.title("🛡️ note分析アプリ ログイン")
         tab_login, tab_signup = st.tabs(["ログイン", "新規登録"])
         
@@ -347,7 +317,10 @@ def main():
     # データ表示
     try:
         conn = get_connection()
-        query = "SELECT * FROM article_stats WHERE user_id = %s" if db_type == "postgres" else "SELECT * FROM article_stats WHERE user_id = ?"
+        if db_type == "postgres":
+            query = "SELECT * FROM article_stats WHERE user_id = %s"
+        else:
+            query = "SELECT * FROM article_stats WHERE user_id = ?"
         df_all = pd.read_sql(query, conn, params=(current_user_id,))
         conn.close()
     except Exception:
