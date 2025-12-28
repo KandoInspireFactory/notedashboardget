@@ -49,29 +49,15 @@ def get_connection():
 def check_stripe_subscription(email):
     """
     Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認する。
-    クーポン使用によるトライアル中（trialling）も有効とみなす。
     """
-    if not stripe.api_key:
-        # APIキーがない場合はチェックをスキップ（開発用）
-        return True
-
+    if not stripe.api_key: return True
     try:
-        # メールアドレスで顧客を検索
         customers = stripe.Customer.list(email=email, limit=1).data
-        if not customers:
-            return False
-        
+        if not customers: return False
         customer_id = customers[0].id
-        # 有効なサブスクリプションを検索（active または trialling）
-        subscriptions = stripe.Subscription.list(
-            customer=customer_id, 
-            status='all', 
-            limit=5
-        ).data
-        
+        subscriptions = stripe.Subscription.list(customer=customer_id, status='all', limit=5).data
         for sub in subscriptions:
-            if sub.status in ['active', 'trialling']:
-                return True
+            if sub.status in ['active', 'trialling']: return True
         return False
     except Exception as e:
         st.error(f"Stripe確認エラー: {e}")
@@ -81,43 +67,33 @@ def neon_auth_login(email, password):
     """ログイン認証を行い、必要に応じてStripeで支払状況を自動更新する"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return True, "local"
-    
     try:
         conn = get_connection()
         cursor = conn.cursor()
         query = "SELECT email, is_approved FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
         cursor.execute(query, (email, password))
         result = cursor.fetchone()
-        
         if result:
             email_res, is_approved = result
-            
-            # もし未承認（is_approved=False）なら、Stripeを確認しに行く
             if not is_approved:
                 if check_stripe_subscription(email):
-                    # 支払いが確認できたので自動承認
                     cursor.execute("UPDATE app_users SET is_approved = TRUE WHERE email = %s", (email,))
                     conn.commit()
                     is_approved = True
-            
             conn.close()
-            
-            if is_approved:
-                return True, "logged_in"
+            if is_approved: return True, "logged_in"
             else:
                 payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
-                return False, f"⚠️ 支払いが確認できていないか、承認待ちです。 [こちらから決済を完了させてください]({payment_link}) 完了後、再度ログインしてください。クーポンをお持ちの方もリンク先で入力可能です。"
+                return False, f"⚠️ 支払いが確認できていないか、承認待ちです。[こちらから決済]({payment_link})を完了させてから再度ログインしてください。クーポンもリンク先で入力可能です。"
         else:
             conn.close()
             return False, "メールアドレスまたはパスワードが正しくありません。"
-    except Exception as e:
-        return False, f"認証エラー: {str(e)}"
+    except Exception as e: return False, f"認証エラー: {str(e)}"
 
 def neon_auth_signup(email, password):
-    """直接DB接続を使用して新規ユーザー登録を行う"""
+    """新規ユーザー登録を行う"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return False, "ローカルモードでは新規登録できません。"
-    
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -125,30 +101,27 @@ def neon_auth_signup(email, password):
         if cursor.fetchone():
             conn.close()
             return False, "このメールアドレスは既に登録されています。"
-        
         cursor.execute("INSERT INTO app_users (email, password_hash) VALUES (%s, crypt(%s, gen_salt('bf')))", (email, password))
         conn.commit()
         conn.close()
-        
         payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
-        return True, f"アカウントを作成しました！ [こちらのリンク]({payment_link}) から決済（月額100円）を完了させてからログインしてください。1ヶ月無料クーポン等をお持ちの方も同じリンクから適用できます。"
-    except Exception as e:
-        return False, f"登録エラー: {str(e)}"
+        return True, f"✅ アカウントを作成しました！\n\n[こちらのStripe決済リンク]({payment_link}) から月額300円の決済を完了させてください。\n\n**🎁 限定クーポン配信中！**\n決済画面で以下を入力するとお得に利用開始できます：\n- **`FREE30`** (最初の1ヶ月無料)\n- **`SPECIAL200`** (ずっと月額200円)\n\n決済完了後、ログインできるようになります。"
+    except Exception as e: return False, f"登録エラー: {str(e)}"
 
 # --- 管理者専用機能 ---
 def admin_get_all_users():
-    """全ユーザーのリストを取得（管理者用）"""
+    """全ユーザーのリストを取得"""
     try:
         conn = get_connection()
         df = pd.read_sql("SELECT email, is_approved, created_at FROM app_users ORDER BY created_at DESC", conn)
         conn.close()
         return df
     except Exception as e:
-        st.error(f"管理者エラー (UserList): {e}")
+        st.error(f"管理者エラー: {e}")
         return pd.DataFrame()
 
 def admin_approve_user(email):
-    """ユーザーを承認する（管理者用）"""
+    """ユーザーを承認"""
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -156,12 +129,10 @@ def admin_approve_user(email):
         conn.commit()
         conn.close()
         return True
-    except Exception as e:
-        st.error(f"承認エラー: {e}")
-        return False
+    except Exception: return False
 
 def admin_delete_user(email):
-    """ユーザーとそのデータを完全に削除する（管理者用）"""
+    """ユーザーとデータを削除"""
     try:
         user_id = hashlib.sha256(email.encode()).hexdigest()[:16]
         conn = get_connection()
@@ -171,12 +142,10 @@ def admin_delete_user(email):
         conn.commit()
         conn.close()
         return True
-    except Exception as e:
-        st.error(f"削除エラー: {e}")
-        return False
+    except Exception: return False
 
 def admin_reset_password(email, new_password):
-    """指定したユーザーのパスワードをリセット（管理者用）"""
+    """パスワードリセット"""
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -185,58 +154,51 @@ def admin_reset_password(email, new_password):
         success = cursor.rowcount > 0
         conn.close()
         return success
-    except Exception as e:
-        st.error(f"パスワードリセットエラー: {e}")
-        return False
+    except Exception: return False
 
 def get_current_user_id(note_email):
-    """ユーザーIDを取得する。"""
+    """ユーザーIDを取得"""
     email = st.session_state.get("app_user_email", note_email)
     if not email: return "guest"
     return hashlib.sha256(email.encode()).hexdigest()[:16]
 
 def get_default_credentials():
-    """Secrets または環境変数からデフォルトのメールとパスワードを取得する"""
+    """Secrets/環境変数から認証情報取得"""
     email = ""
     password = ""
     try:
         if "note" in st.secrets:
             email = st.secrets["note"].get("email", "")
             password = st.secrets["note"].get("password", "")
-    except:
-        pass
+    except: pass
     if not email: email = os.getenv("NOTE_EMAIL", "")
     if not password: password = os.getenv("NOTE_PASSWORD", "")
     return email, password
 
 def note_auth(session, email_address, password):
-    """noteにログインしてセッションを認証する"""
+    """noteにログイン"""
     user_data = {"login": email_address, "password": password}
     url = 'https://note.com/api/v1/sessions/sign_in'
     try:
         r = session.post(url, json=user_data)
         r.raise_for_status()
         res_json = r.json()
-        if "error" in res_json:
-            st.error(f"noteログインエラー: {res_json.get('error', '不明なエラー')}")
-            return None
+        if "error" in res_json: return None
         return session
-    except Exception:
-        st.error("noteの認証中にエラーが発生しました。")
-        return None
+    except Exception: return None
 
 # =========================================================================
 # 2. データ操作ロジック
 # =========================================================================
 def get_articles(session, user_id):
-    """noteの統計APIから記事データを全件取得する"""
+    """記事データを取得"""
     articles = []
     tdy = datetime.now().strftime('%Y-%m-%d')
     page = 1
     progress_bar = st.progress(0)
     status_text = st.empty()
     while True:
-        status_text.text(f"ページ {page} を取得中...")
+        status_text.text(f"ページ {page} 取得中...")
         url = f'https://note.com/api/v1/stats/pv?filter=all&page={page}&sort=pv'
         try:
             r = session.get(url)
@@ -247,8 +209,7 @@ def get_articles(session, user_id):
         if not stats: break
         for item in stats:
             name = item.get('name')
-            if name:
-                articles.append((user_id, tdy, item.get('id'), name, item.get('read_count', 0), item.get('like_count', 0), item.get('comment_count', 0)))
+            if name: articles.append((user_id, tdy, item.get('id'), name, item.get('read_count', 0), item.get('like_count', 0), item.get('comment_count', 0)))
         page += 1
         progress_bar.progress(min(page * 0.05, 1.0))
     status_text.text("完了！")
@@ -256,7 +217,7 @@ def get_articles(session, user_id):
     return articles
 
 def save_data(articles_data, save_dir):
-    """DBタイプに合わせて保存する"""
+    """保存"""
     if not os.path.exists(save_dir): os.makedirs(save_dir)
     db_type, _ = get_db_info()
     try:
@@ -279,15 +240,15 @@ def save_data(articles_data, save_dir):
 # =========================================================================
 def main():
     db_type, _ = get_db_info()
-    st.set_page_config(page_title=f"note分析 v7 ({db_type.capitalize()})", layout="wide")
+    st.set_page_config(page_title=f"note分析 v7", layout="wide")
 
     if "app_auth_token" not in st.session_state: st.session_state.app_auth_token = None
     if "app_user_email" not in st.session_state: st.session_state.app_user_email = None
 
-    # --- アプリログイン（Neon Auth + Stripe自動承認） ---
+    # --- アプリログイン ---
     if db_type == "postgres" and not st.session_state.app_auth_token:
         st.title("🛡️ note分析アプリ ログイン")
-        tab_login, tab_signup = st.tabs(["ログイン", "新規登録"])
+        tab_login, tab_signup = st.tabs(["ログイン", "新規利用登録"])
         
         with tab_login:
             with st.form("login_form"):
@@ -300,12 +261,14 @@ def main():
                         st.session_state.app_user_email = email
                         st.success("ログイン成功！")
                         st.rerun()
-                    else:
-                        st.error(result)
+                    else: st.error(result)
         
         with tab_signup:
+            st.write("✨ **プレミアム note 分析ツール (v7 Cloud)**")
+            st.write("記事の伸びを自動で記録し、あなたの運用を加速させる強力なパートナーです。")
+            st.info("【ご利用料金】 月額 300 円")
+            
             with st.form("signup_form"):
-                st.write("✨ 月額100円で分析ツールを利用できます（クーポン利用可能）。")
                 new_email = st.text_input("メールアドレス")
                 new_password = st.text_input("パスワード", type="password")
                 confirm_password = st.text_input("パスワード（確認）", type="password")
@@ -319,11 +282,7 @@ def main():
         return
 
     # --- 管理者判定 ---
-    is_admin = False
-    admin_email_env = os.getenv("ADMIN_EMAIL")
-    if st.session_state.app_user_email and admin_email_env:
-        if st.session_state.app_user_email == admin_email_env:
-            is_admin = True
+    is_admin = (st.session_state.app_user_email == os.getenv("ADMIN_EMAIL")) if os.getenv("ADMIN_EMAIL") else False
 
     # --- サイドバー設定 ---
     st.sidebar.header("🔑 note取得設定")
@@ -335,82 +294,52 @@ def main():
             st.rerun()
 
     menu = ["ダッシュボード"]
-    if is_admin:
-        menu.append("🛠️ 管理者画面")
-    
+    if is_admin: menu.append("🛠️ 管理者画面")
     choice = st.sidebar.radio("メニュー", menu)
 
-    # --- [管理者画面] ---
+    # --- 管理者画面 ---
     if choice == "🛠️ 管理者画面":
         st.title("🛠️ 管理者ダッシュボード")
         tab_user_list, tab_actions = st.tabs(["ユーザー管理", "一括操作"])
-        
         with tab_user_list:
             users_df = admin_get_all_users()
             if not users_df.empty:
-                st.write("### 登録済みユーザー")
                 users_df['status'] = users_df['is_approved'].apply(lambda x: "✅ 承認済" if x else "⏳ 承認待ち")
                 st.dataframe(users_df[['email', 'status', 'created_at']], use_container_width=True)
-            else:
-                st.write("ユーザーはまだ登録されていません。")
-        
         with tab_actions:
-            st.write("### ユーザーの承認・パスワードリセット・削除")
             with st.form("admin_action_form"):
                 target_email = st.text_input("対象のメールアドレス")
-                action = st.selectbox("操作を選択", ["---", "承認する", "パスワードリセット", "アカウント削除"])
-                new_pwd = st.text_input("新しいパスワード（リセット時のみ）", type="password")
-                
+                action = st.selectbox("操作", ["---", "承認する", "パスワードリセット", "アカウント削除"])
+                new_pwd = st.text_input("新しいパスワード", type="password")
                 if st.form_submit_button("実行"):
-                    if not target_email:
-                        st.error("対象のメールアドレスを入力してください。")
-                    elif action == "承認する":
-                        if admin_approve_user(target_email):
-                            st.success(f"{target_email} を承認しました。")
-                            st.rerun()
-                    elif action == "パスワードリセット":
-                        if new_pwd and admin_reset_password(target_email, new_pwd):
-                            st.success(f"{target_email} のパスワードを更新しました。")
-                        else: st.error("パスワードを入力してください。")
-                    elif action == "アカウント削除":
-                        if admin_delete_user(target_email):
-                            st.success(f"{target_email} とそのデータを完全に削除しました。")
-                            st.rerun()
+                    if action == "承認する": admin_approve_user(target_email)
+                    elif action == "パスワードリセット": admin_reset_password(target_email, new_pwd)
+                    elif action == "アカウント削除": admin_delete_user(target_email)
+                    st.rerun()
         return
 
-    # --- [ダッシュボード画面] ---
-    st.title(f"📝 note分析ダッシュボード (v7 {db_type.capitalize()})")
+    # --- メインダッシュボード ---
+    st.title(f"📝 note分析ダッシュボード")
     default_email, default_pw = get_default_credentials()
-
     note_email = st.sidebar.text_input("noteメールアドレス", value=default_email)
     note_password = st.sidebar.text_input("noteパスワード", type="password", value=default_pw)
     current_user_id = get_current_user_id(note_email)
     
     if st.sidebar.button("最新データを取得する"):
-        if not note_email or not note_password: st.sidebar.error("情報を入力してください。")
-        else:
-            session = requests.session()
-            if note_auth(session, note_email, note_password):
-                data = get_articles(session, current_user_id)
-                if data:
-                    res_db_type = save_data(data, "note_data")
-                    st.sidebar.success(f"更新成功！ ({res_db_type})")
-                    st.balloons()
-                    st.rerun()
-                else: st.sidebar.warning("記事なし")
+        session = requests.session()
+        if note_auth(session, note_email, note_password):
+            data = get_articles(session, current_user_id)
+            if data:
+                save_data(data, "note_data")
+                st.rerun()
 
     # データ表示
     try:
         conn = get_connection()
-        if db_type == "postgres":
-            query = "SELECT * FROM article_stats WHERE user_id = %s"
-        else:
-            query = "SELECT * FROM article_stats WHERE user_id = ?"
+        query = "SELECT * FROM article_stats WHERE user_id = %s" if db_type == "postgres" else "SELECT * FROM article_stats WHERE user_id = ?"
         df_all = pd.read_sql(query, conn, params=(current_user_id,))
         conn.close()
-    except Exception:
-        df_all = pd.DataFrame()
-        st.info("データがありません。サイドバーから取得してください。")
+    except Exception: df_all = pd.DataFrame()
 
     if not df_all.empty:
         df_all['acquired_at'] = pd.to_datetime(df_all['acquired_at'], format='mixed')
@@ -422,7 +351,6 @@ def main():
         has_previous = len(unique_dates) >= 2
         total_views_delta = 0
         df_delta = pd.DataFrame()
-
         if has_previous:
             previous_date = unique_dates[-2]
             df_prev = df_all[df_all['acquired_at'] == previous_date]
