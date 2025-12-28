@@ -5,7 +5,8 @@ import traceback
 import csv
 from datetime import datetime
 import os
-import sqlite3
+import psycopg2
+from psycopg2.extras import execute_values
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -17,6 +18,11 @@ load_dotenv()
 # =========================================================================
 # 1. ログイン認証・秘密情報ロード
 # =========================================================================
+def get_db_connection():
+    """Neon (PostgreSQL) への接続を確立する"""
+    db_url = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_rSWRuhL75PXO@ep-restless-hill-a1k95dvi-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
+    return psycopg2.connect(db_url)
+
 def get_default_credentials():
     """Secrets または環境変数からデフォルトのメールとパスワードを取得する"""
     email = ""
@@ -87,14 +93,14 @@ def get_articles(session):
         for item in stats:
             name = item.get('name')
             if name:
-                articles.append([
+                articles.append((
                     tdy, 
                     item.get('id'), 
                     name, 
                     item.get('read_count', 0), 
                     item.get('like_count', 0), 
                     item.get('comment_count', 0)
-                ])
+                ))
 
         page += 1
         progress_bar.progress(min(page * 0.05, 1.0))
@@ -104,34 +110,41 @@ def get_articles(session):
     return articles
 
 # =========================================================================
-# 3. データ保存 (SQLite / CSV)
+# 3. データ保存 (PostgreSQL / CSV)
 # =========================================================================
 def save_data(articles_data, save_dir):
-    """SQLiteとCSVの両方に保存する"""
+    """PostgreSQLとCSVの両方に保存する"""
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    # SQLite保存 (note_dashboard.db に統一)
-    db_path = 'note_dashboard.db'
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS article_stats (
-            acquired_at TEXT,
-            article_id INTEGER,
-            title TEXT,
-            views INTEGER,
-            likes INTEGER,
-            comments INTEGER,
-            PRIMARY KEY (acquired_at, article_id)
-        )
-    ''')
-    cursor.executemany(
-        'INSERT OR IGNORE INTO article_stats VALUES (?, ?, ?, ?, ?, ?)', 
-        articles_data
-    )
-    conn.commit()
-    conn.close()
+    # PostgreSQL保存
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # テーブル作成
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS article_stats (
+                acquired_at TEXT,
+                article_id BIGINT,
+                title TEXT,
+                views INTEGER,
+                likes INTEGER,
+                comments INTEGER,
+                PRIMARY KEY (acquired_at, article_id)
+            )
+        ''')
+        # PostgreSQL用の INSERT ... ON CONFLICT DO NOTHING
+        insert_query = """
+            INSERT INTO article_stats (acquired_at, article_id, title, views, likes, comments)
+            VALUES %s
+            ON CONFLICT (acquired_at, article_id) DO NOTHING
+        """
+        execute_values(cursor, insert_query, articles_data)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        st.error(f"データベース保存エラー: {e}")
 
     # CSV保存 (履歴用)
     today_str = datetime.now().strftime('%Y%m%d')
@@ -139,14 +152,14 @@ def save_data(articles_data, save_dir):
     df = pd.DataFrame(articles_data, columns=['acquired_at', 'article_id', 'title', 'views', 'likes', 'comments'])
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     
-    return db_path, csv_path
+    return "Neon (Postgres)", csv_path
 
 # =========================================================================
 # 4. Streamlit UI
 # =========================================================================
 def main():
-    st.set_page_config(page_title="note分析 Basic v4", layout="wide")
-    st.title("📝 note分析ダッシュボード (v7 Basic)")
+    st.set_page_config(page_title="note分析 Basic v4 (Neon版)", layout="wide")
+    st.title("📝 note分析ダッシュボード (v7 Cloud)")
     
     # デフォルト値の取得
     default_email, default_pw = get_default_credentials()
@@ -166,149 +179,144 @@ def main():
             if note_auth(session, email, password):
                 data = get_articles(session)
                 if data:
-                    db_path, _ = save_data(data, save_dir)
-                    st.sidebar.success("データの更新に成功しました！")
+                    db_name, _ = save_data(data, save_dir)
+                    st.sidebar.success(f"データの更新に成功しました！ ({db_name})")
                     st.balloons()
                     st.rerun() # 再起動して最新データを表示
                 else:
                     st.sidebar.warning("記事が見つかりませんでした。")
 
     # メメインエリア: データ表示
-    db_file = 'note_dashboard.db'
-    if os.path.exists(db_file):
-        conn = sqlite3.connect(db_file)
+    try:
+        conn = get_db_connection()
         df_all = pd.read_sql('SELECT * FROM article_stats', conn)
         conn.close()
+    except Exception as e:
+        df_all = pd.DataFrame()
+        st.info("データベースの接続を待機中、またはデータがありません。サイドバーから取得を開始してください。")
 
-        if not df_all.empty:
-            # 日付処理の安定化
-            df_all['acquired_at'] = pd.to_datetime(df_all['acquired_at'], format='mixed')
-            df_all = df_all.sort_values('acquired_at')
-            unique_dates = sorted(df_all['acquired_at'].unique())
+    if not df_all.empty:
+        # 日付処理の安定化
+        df_all['acquired_at'] = pd.to_datetime(df_all['acquired_at'], format='mixed')
+        df_all = df_all.sort_values('acquired_at')
+        unique_dates = sorted(df_all['acquired_at'].unique())
+        
+        latest_date = unique_dates[-1]
+        df_latest = df_all[df_all['acquired_at'] == latest_date].sort_values('views', ascending=False)
+        
+        # --- 前日比（増分）の計算 ---
+        has_previous = len(unique_dates) >= 2
+        total_views_delta = 0
+        total_likes_delta = 0
+        df_delta = pd.DataFrame()
+
+        if has_previous:
+            previous_date = unique_dates[-2]
+            df_prev = df_all[df_all['acquired_at'] == previous_date]
             
-            latest_date = unique_dates[-1]
-            df_latest = df_all[df_all['acquired_at'] == latest_date].sort_values('views', ascending=False)
+            # 最新と直前をマージして差分を出す
+            df_merge = pd.merge(
+                df_latest[['article_id', 'title', 'views', 'likes']], 
+                df_prev[['article_id', 'views', 'likes']], 
+                on='article_id', suffixes=('', '_prev'), how='left'
+            ).fillna(0)
             
-            # --- 前日比（増分）の計算 ---
-            has_previous = len(unique_dates) >= 2
-            total_views_delta = 0
-            total_likes_delta = 0
-            df_delta = pd.DataFrame()
-
-            if has_previous:
-                previous_date = unique_dates[-2]
-                df_prev = df_all[df_all['acquired_at'] == previous_date]
-                
-                # 最新と直前をマージして差分を出す
-                df_merge = pd.merge(
-                    df_latest[['article_id', 'title', 'views', 'likes']], 
-                    df_prev[['article_id', 'views', 'likes']], 
-                    on='article_id', suffixes=('', '_prev'), how='left'
-                ).fillna(0)
-                
-                df_merge['views_delta'] = df_merge['views'] - df_merge['views_prev']
-                df_merge['likes_delta'] = df_merge['likes'] - df_merge['likes_prev']
-                
-                # 合計増分
-                total_views_delta = int(df_merge['views_delta'].sum())
-                total_likes_delta = int(df_merge['likes_delta'].sum())
-                df_delta = df_merge.sort_values('views_delta', ascending=False)
-
-            # サマリー表示
-            st.info(f"最終更新日: {latest_date.strftime('%Y-%m-%d %H:%M')}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("公開中の記事数", f"{len(df_latest)} 記事")
-            c2.metric("累計総ビュー数", f"{df_latest['views'].sum():,}", 
-                      delta=f"+{total_views_delta:,}" if has_previous else None)
-            c3.metric("累計総スキ数", f"{df_latest['likes'].sum():,}", 
-                      delta=f"+{total_likes_delta:,}" if has_previous else None)
-
-            st.markdown("---")
-
-            # --- 上部: 全体累計ビュー推移 ---
-            st.subheader("📈 全体累計ビュー推移")
-            if has_previous:
-                total_views_df = df_all.groupby('acquired_at')['views'].sum().reset_index()
-                fig_total = px.line(total_views_df, x='acquired_at', y='views', 
-                                    title='全記事の合計累計閲覧数推移',
-                                    labels={'acquired_at':'日付', 'views':'合計累計ビュー数'})
-                fig_total.update_traces(mode='lines+markers')
-                fig_total.update_layout(
-                    xaxis_type='date',
-                    yaxis=dict(tickformat=',d', rangemode='tozero')
-                )
-                st.plotly_chart(fig_total, use_container_width=True)
-            else:
-                st.info("📉 推移グラフを表示するには、2日分以上のデータが必要です。明日また最新データを取得してください。")
-
-            st.markdown("---")
+            df_merge['views_delta'] = df_merge['views'] - df_merge['views_prev']
+            df_merge['likes_delta'] = df_merge['likes'] - df_merge['likes_prev']
             
-            # グラフエリア
-            tab1, tab2, tab3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
-            
-            with tab1:
-                fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h',
-                             text_auto=True,
-                             title="累計ビュー数 TOP 20", 
-                             labels={'views':'累計ビュー数', 'title':'記事タイトル'})
-                fig.update_layout(yaxis={'autorange': 'reversed'}, height=600)
-                st.plotly_chart(fig, use_container_width=True)
+            # 合計増分
+            total_views_delta = int(df_merge['views_delta'].sum())
+            total_likes_delta = int(df_merge['likes_delta'].sum())
+            df_delta = df_merge.sort_values('views_delta', ascending=False)
 
-            with tab2:
-                if has_previous:
-                    fig_delta = px.bar(df_delta.head(20), x='views_delta', y='title', orientation='h',
-                                 text_auto=True,
-                                 title="本日のビュー増加数 TOP 20", 
-                                 labels={'views_delta':'本日増えたビュー数', 'title':'記事タイトル'})
-                    fig_delta.update_layout(yaxis={'autorange': 'reversed'}, height=600)
-                    st.plotly_chart(fig_delta, use_container_width=True)
-                else:
-                    st.info("🔥 「本日の伸び」ランキングを表示するには、明日もう一度データを取得してください。2日分のデータが溜まると、前回からの増分が表示されます。")
+        # サマリー表示
+        st.info(f"最終更新日: {latest_date.strftime('%Y-%m-%d %H:%M')}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("公開中の記事数", f"{len(df_latest)} 記事")
+        c2.metric("累計総ビュー数", f"{df_latest['views'].sum():,}", 
+                  delta=f"+{total_views_delta:,}" if has_previous else None)
+        c3.metric("累計総スキ数", f"{df_latest['likes'].sum():,}", 
+                  delta=f"+{total_likes_delta:,}" if has_previous else None)
 
-            with tab3:
-                st.dataframe(df_latest, use_container_width=True)
+        st.markdown("---")
 
-            # --- 下部: 全記事の時系列ビュー数推移 ---
-            st.markdown("---")
-            st.subheader("📊 全記事の個別ビュー数推移")
-            
-            if has_previous:
-                df_pivot_src = df_all[['acquired_at', 'title', 'views']].drop_duplicates(['acquired_at', 'title'])
-                pivot_df = df_pivot_src.pivot(index='acquired_at', columns='title', values='views')
-                
-                fig_all = go.Figure()
-                for title in pivot_df.columns:
-                    fig_all.add_trace(go.Scatter(
-                        x=pivot_df.index, 
-                        y=pivot_df[title], 
-                        mode='lines', 
-                        name=title, 
-                        connectgaps=True,
-                        hovertemplate='<b>%{fullData.name}</b><br>日付: %{x}<br>ビュー数: %{y:,}<extra></extra>'
-                    ))
-                fig_all.update_layout(
-                    title='全記事の累計閲覧数推移（個別）',
-                    xaxis_title='日付',
-                    yaxis_title='累計閲覧数',
-                    hovermode='closest',
-                    showlegend=False,
-                    height=700,
-                    xaxis_type='date',
-                    yaxis=dict(tickformat=',d')
-                )
-                st.plotly_chart(fig_all, use_container_width=True)
-            else:
-                st.info("📉 個別記事の推移を表示するには、2日分以上のデータが必要です。")
-
-            # ダウンロード
-            with st.expander("📥 データのダウンロード"):
-                st.write("SQLiteデータベースファイル（note_dashboard.db）をダウンロードできます。")
-                with open(db_file, "rb") as f:
-                    st.download_button("SQLite DBをダウンロード", f, file_name="note_dashboard.db")
+        # --- 上部: 全体累計ビュー推移 ---
+        st.subheader("📈 全体累計ビュー推移")
+        if has_previous:
+            total_views_df = df_all.groupby('acquired_at')['views'].sum().reset_index()
+            fig_total = px.line(total_views_df, x='acquired_at', y='views', 
+                                title='全記事の合計累計閲覧数推移',
+                                labels={'acquired_at':'日付', 'views':'合計累計ビュー数'})
+            fig_total.update_traces(mode='lines+markers')
+            fig_total.update_layout(
+                xaxis_type='date',
+                yaxis=dict(tickformat=',d', rangemode='tozero')
+            )
+            st.plotly_chart(fig_total, use_container_width=True)
         else:
-            st.info("まだデータがありません。サイドバーから取得を開始してください。")
+            st.info("📉 推移グラフを表示するには、2日分以上のデータが必要です。明日また最新データを取得してください。")
+
+        st.markdown("---")
+        
+        # グラフエリア
+        tab1, tab2, tab3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
+        
+        with tab1:
+            fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h',
+                         text_auto=True,
+                         title="累計ビュー数 TOP 20", 
+                         labels={'views':'累計ビュー数', 'title':'記事タイトル'})
+            fig.update_layout(yaxis={'autorange': 'reversed'}, height=600)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with tab2:
+            if has_previous:
+                fig_delta = px.bar(df_delta.head(20), x='views_delta', y='title', orientation='h',
+                             text_auto=True,
+                             title="本日のビュー増加数 TOP 20", 
+                             labels={'views_delta':'本日増えたビュー数', 'title':'記事タイトル'})
+                fig_delta.update_layout(yaxis={'autorange': 'reversed'}, height=600)
+                st.plotly_chart(fig_delta, use_container_width=True)
+            else:
+                st.info("🔥 「本日の伸び」ランキングを表示するには、明日もう一度データを取得してください。2日分のデータが溜まると、前回からの増分が表示されます。")
+
+        with tab3:
+            st.dataframe(df_latest, use_container_width=True)
+
+        # --- 下部: 全記事の時系列ビュー数推移 ---
+        st.markdown("---")
+        st.subheader("📊 全記事の個別ビュー数推移")
+        
+        if has_previous:
+            df_pivot_src = df_all[['acquired_at', 'title', 'views']].drop_duplicates(['acquired_at', 'title'])
+            pivot_df = df_pivot_src.pivot(index='acquired_at', columns='title', values='views')
+            
+            fig_all = go.Figure()
+            for title in pivot_df.columns:
+                fig_all.add_trace(go.Scatter(
+                    x=pivot_df.index, 
+                    y=pivot_df[title], 
+                    mode='lines', 
+                    name=title, 
+                    connectgaps=True,
+                    hovertemplate='<b>%{fullData.name}</b><br>日付: %{x}<br>ビュー数: %{y:,}<extra></extra>'
+                ))
+            fig_all.update_layout(
+                title='全記事の累計閲覧数推移（個別）',
+                xaxis_title='日付',
+                yaxis_title='累計閲覧数',
+                hovermode='closest',
+                showlegend=False,
+                height=700,
+                xaxis_type='date',
+                yaxis=dict(tickformat=',d')
+            )
+            st.plotly_chart(fig_all, use_container_width=True)
+        else:
+            st.info("📉 個別記事の推移を表示するには、2日分以上のデータが必要です。")
+
     else:
-        st.info("データファイル（SQLite DB）が見つかりません。サイドバーから取得を開始してください。")
+        st.info("まだデータがありません。サイドバーから取得を開始してください。")
 
 if __name__ == "__main__":
     main()
