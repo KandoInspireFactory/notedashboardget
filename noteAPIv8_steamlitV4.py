@@ -31,27 +31,19 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # 1. データベース接続・環境判別・初期化
 # =========================================================================
 def get_db_info():
-    """環境変数からDBタイプを判別する"""
     db_url = os.getenv("DATABASE_URL")
-    if db_url and HAS_POSTGRES:
-        return "postgres", db_url
-    else:
-        return "sqlite", "note_dashboard.db"
+    if db_url and HAS_POSTGRES: return "postgres", db_url
+    else: return "sqlite", "note_dashboard.db"
 
 def get_connection():
-    """適切なデータベース接続を返す"""
     db_type, db_target = get_db_info()
-    if db_type == "postgres":
-        return psycopg2.connect(db_target)
-    else:
-        return sqlite3.connect(db_target)
+    if db_type == "postgres": return psycopg2.connect(db_target)
+    else: return sqlite3.connect(db_target)
 
 def init_db_schema():
-    """データベースのテーブル構造を自動でセットアップ/更新する"""
     db_type, _ = get_db_info()
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = get_connection(); cursor = conn.cursor()
         if db_type == "postgres":
             cursor.execute('CREATE EXTENSION IF NOT EXISTS pgcrypto;')
             cursor.execute('''
@@ -64,34 +56,16 @@ def init_db_schema():
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             ''')
-            # 必要なカラムのマイグレーション
             cols = ["is_approved", "skip_stripe"]
             for col in cols:
                 cursor.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='app_users' AND column_name='{col}') THEN ALTER TABLE app_users ADD COLUMN {col} BOOLEAN DEFAULT FALSE; END IF; END $$")
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS article_stats (
-                    user_id TEXT, acquired_at TEXT, article_id BIGINT, title TEXT,
-                    views INTEGER, likes INTEGER, comments INTEGER,
-                    PRIMARY KEY (user_id, acquired_at, article_id)
-                );
-            ''')
+            cursor.execute('CREATE TABLE IF NOT EXISTS article_stats (user_id TEXT, acquired_at TEXT, article_id BIGINT, title TEXT, views INTEGER, likes INTEGER, comments INTEGER, PRIMARY KEY (user_id, acquired_at, article_id));')
         else:
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS article_stats (
-                    user_id TEXT, acquired_at TEXT, article_id INTEGER, title TEXT,
-                    views INTEGER, likes INTEGER, comments INTEGER,
-                    PRIMARY KEY (user_id, acquired_at, article_id)
-                );
-            ''')
-        conn.commit()
-        conn.close()
+            cursor.execute('CREATE TABLE IF NOT EXISTS article_stats (user_id TEXT, acquired_at TEXT, article_id INTEGER, title TEXT, views INTEGER, likes INTEGER, comments INTEGER, PRIMARY KEY (user_id, acquired_at, article_id));')
+        conn.commit(); conn.close()
     except Exception: pass
 
 def check_stripe_subscription(email):
-    """
-    Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認。
-    """
-    # 管理者は常にTrue
     if email == os.getenv("ADMIN_EMAIL"): return True
     if not stripe.api_key: return True
     try:
@@ -100,61 +74,43 @@ def check_stripe_subscription(email):
         customer_id = customers[0].id
         subs = stripe.Subscription.list(customer=customer_id, status='all', limit=5).data
         for sub in subs:
-            # active または trialling（無料クーポン期間）ならOK
             if sub.status in ['active', 'trialling']: return True
         return False
     except Exception: return False
 
 def neon_auth_login(email, password):
-    """ログイン認証を行い、Stripeの最新状況を自動反映させる"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return True, "local"
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = get_connection(); cursor = conn.cursor()
         query = "SELECT email, is_approved, skip_stripe FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
         cursor.execute(query, (email, password))
         result = cursor.fetchone()
-        
         if result:
             email_res, current_approved, skip_stripe = result
-            
-            # --- 自動承認ロジック ---
-            if skip_stripe:
-                access_allowed = True
-            else:
-                # ログインのたびにStripeを確認して自動で承認・非承認を切り替える
-                access_allowed = check_stripe_subscription(email)
-            
+            access_allowed = True if skip_stripe else check_stripe_subscription(email)
             if access_allowed != current_approved:
                 cursor.execute("UPDATE app_users SET is_approved = %s WHERE email = %s", (access_allowed, email))
                 conn.commit()
-            
             conn.close()
-            if access_allowed:
-                return True, "logged_in"
+            if access_allowed: return True, "logged_in"
             else:
                 p_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
                 return False, f"⚠️ サブスクリプションが有効ではありません。[こちらのリンク]({p_link}) から決済を完了させてください。"
         else:
-            conn.close()
-            return False, "メールアドレスまたはパスワードが正しくありません。"
+            conn.close(); return False, "メールアドレスまたはパスワードが正しくありません。"
     except Exception as e: return False, f"認証エラー: {str(e)}"
 
 def neon_auth_signup(email, password):
-    """新規ユーザー登録"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return False, "Local mode doesn't support signup."
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = get_connection(); cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM app_users WHERE email = %s", (email,))
         if cursor.fetchone():
-            conn.close()
-            return False, "このメールアドレスは既に登録されています。"
+            conn.close(); return False, "このメールアドレスは既に登録されています。"
         cursor.execute("INSERT INTO app_users (email, password_hash) VALUES (%s, crypt(%s, gen_salt('bf')))", (email, password))
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
         p_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
         return True, f"✅ 登録が完了しました！\n\n[こちらのStripe決済リンク]({p_link}) から月額300円の決済を完了させてください。\n\nクーポン `FREE30` で1ヶ月無料、`SPECIAL200` でずっと200円になります。決済完了後、すぐにログイン可能です。"
     except Exception as e: return False, f"登録エラー: {str(e)}"
@@ -205,13 +161,16 @@ def get_articles(session, user_id):
     articles = []; tdy = datetime.now().strftime('%Y-%m-%d'); page = 1
     pb = st.progress(0); txt = st.empty()
     while True:
-        txt.text(f"ページ {page} 取得中..."); r = session.get(f'https://note.com/api/v1/stats/pv?filter=all&page={page}&sort=pv')
-        data = r.json(); stats = data.get('data', {}).get('note_stats', [])
-        if not stats: break
-        for item in stats:
-            name = item.get('name')
-            if name: articles.append((user_id, tdy, item.get('id'), name, item.get('read_count', 0), item.get('like_count', 0), item.get('comment_count', 0)))
-        page += 1; pb.progress(min(page * 0.05, 1.0))
+        txt.text(f"ページ {page} 取得中...")
+        try:
+            r = session.get(f'https://note.com/api/v1/stats/pv?filter=all&page={page}&sort=pv')
+            data = r.json(); stats = data.get('data', {}).get('note_stats', [])
+            if not stats: break
+            for item in stats:
+                name = item.get('name')
+                if name: articles.append((user_id, tdy, item.get('id'), name, item.get('read_count', 0), item.get('like_count', 0), item.get('comment_count', 0)))
+            page += 1; pb.progress(min(page * 0.05, 1.0))
+        except Exception: break
     pb.empty(); return articles
 
 def save_data(data, save_dir):
@@ -235,10 +194,11 @@ def main():
     if "app_auth_token" not in st.session_state: st.session_state.app_auth_token = None
     if "app_user_email" not in st.session_state: st.session_state.app_user_email = None
 
-    # --- アプリログイン（全自動） ---
+    # --- アプリログイン ---
     if db_type == "postgres" and not st.session_state.app_auth_token:
         st.title("🛡️ note分析アプリ ログイン")
         tab_l, tab_s = st.tabs(["ログイン", "新規利用登録"])
+        
         with tab_l:
             with st.form("login"):
                 e = st.text_input("メールアドレス"); p = st.text_input("パスワード", type="password")
@@ -246,6 +206,7 @@ def main():
                     ok, res = neon_auth_login(e, p)
                     if ok: st.session_state.app_auth_token=res; st.session_state.app_user_email=e; st.rerun()
                     else: st.error(res)
+        
         with tab_s:
             st.write("✨ **プレミアム note 分析ツール (v7 Cloud)**")
             st.info("【ご利用料金】 月額 300 円")
@@ -255,16 +216,23 @@ def main():
                     if np != cp: st.error("パスワード不一致")
                     elif len(np)<4: st.error("4文字以上必要")
                     else: ok, msg = neon_auth_signup(ne, np); st.info(msg) if ok else st.error(msg)
+        
+        # セキュリティの案内を追加
+        with st.expander("🔐 セキュリティとプライバシーについて"):
+            st.write("""
+            - **noteパスワードの保護**: あなたのnoteパスワードはデータベースに保存されません。セッション中のみ一時的に使用されます。
+            - **データの独立性**: あなたが取得した記事データは、暗号化されたユーザーIDに紐付けられ、他のユーザーから閲覧されることはありません。
+            - **管理者の権限**: 管理者はシステムの保守目的以外で個別のデータを閲覧・利用することはありません。
+            """)
         return
 
-    # --- 管理者判定とメニュー（シンプル版） ---
     is_admin = (st.session_state.app_user_email == os.getenv("ADMIN_EMAIL")) if os.getenv("ADMIN_EMAIL") else False
     st.sidebar.header("🔑 設定")
     if st.session_state.app_user_email:
         st.sidebar.info(f"👤 {st.session_state.app_user_email}")
         if st.sidebar.button("ログアウト"): st.session_state.app_auth_token=None; st.session_state.app_user_email=None; st.rerun()
 
-    menu = ["ダッシュボード"]
+    menu = ["ダッシュボード"]; 
     if is_admin: menu.append("🛠️ ユーザー管理")
     choice = st.sidebar.radio("メニュー", menu)
 
@@ -280,7 +248,6 @@ def main():
                     if admin_delete_user(te): st.success(f"{te} を削除しました。"); st.rerun()
         return
 
-    # --- メインダッシュボード ---
     st.title("📝 note分析ダッシュボード")
     de, dp = get_default_credentials(); ne = st.sidebar.text_input("noteメールアドレス", value=de); np = st.sidebar.text_input("noteパスワード", type="password", value=dp); uid = get_current_user_id(ne)
     
@@ -289,6 +256,7 @@ def main():
         if note_auth(s, ne, np):
             data = get_articles(s, uid)
             if data: save_data(data, "note_data"); st.rerun()
+        else: st.sidebar.error("noteの認証に失敗しました。")
 
     try:
         conn = get_connection(); q = "SELECT * FROM article_stats WHERE user_id = %s" if db_type == "postgres" else "SELECT * FROM article_stats WHERE user_id = ?"
