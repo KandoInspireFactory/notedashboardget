@@ -83,6 +83,36 @@ def neon_auth_signup(email, password):
     except Exception as e:
         return False, f"登録エラー: {str(e)}"
 
+# --- 管理者専用機能 ---
+def admin_get_all_users():
+    """全ユーザーのリストを取得（管理者用）"""
+    try:
+        conn = get_connection()
+        df = pd.read_sql("SELECT email, created_at FROM app_users ORDER BY created_at DESC", conn)
+        conn.close()
+        return df
+    except Exception as e:
+        st.error(f"管理者エラー (UserList): {e}")
+        return pd.DataFrame()
+
+def admin_reset_password(email, new_password):
+    """指定したユーザーのパスワードをリセット（管理者用）"""
+    db_type, _ = get_db_info()
+    if db_type != "postgres":
+        st.error("パスワードリセットはCloud版でのみ利用可能です。")
+        return False
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE app_users SET password_hash = crypt(%s, gen_salt('bf')) WHERE email = %s", (new_password, email))
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        return success
+    except Exception as e:
+        st.error(f"管理者エラー (Reset): {e}")
+        return False
+
 def get_current_user_id(note_email):
     """ユーザーIDを取得する。"""
     email = st.session_state.get("app_user_email", note_email)
@@ -211,10 +241,14 @@ def main():
                         else: st.error(message)
         return
 
-    # --- メインダッシュボード ---
-    st.title(f"📝 note分析ダッシュボード (v7 {db_type.capitalize()})")
-    default_email, default_pw = get_default_credentials()
+    # --- 管理者判定 ---
+    is_admin = False
+    admin_email_env = os.getenv("ADMIN_EMAIL")
+    if st.session_state.app_user_email and admin_email_env:
+        if st.session_state.app_user_email == admin_email_env:
+            is_admin = True
 
+    # --- サイドバー設定 ---
     st.sidebar.header("🔑 note取得設定")
     if st.session_state.app_user_email:
         st.sidebar.info(f"👤 {st.session_state.app_user_email}")
@@ -222,6 +256,43 @@ def main():
             st.session_state.app_auth_token = None
             st.session_state.app_user_email = None
             st.rerun()
+
+    menu = ["ダッシュボード"]
+    if is_admin:
+        menu.append("🛠️ 管理者画面")
+    
+    choice = st.sidebar.radio("メニュー", menu)
+
+    # --- [管理者画面] ---
+    if choice == "🛠️ 管理者画面":
+        st.title("🛠️ 管理者ダッシュボード")
+        st.write("登録済みユーザーの管理を行います。")
+        
+        tab_user_list, tab_reset = st.tabs(["ユーザー一覧", "パスワードリセット"])
+        
+        with tab_user_list:
+            users_df = admin_get_all_users()
+            if not users_df.empty:
+                st.dataframe(users_df, use_container_width=True)
+            else:
+                st.write("ユーザーはまだ登録されていません。")
+        
+        with tab_reset:
+            st.warning("指定したユーザーのパスワードを強制的に書き換えます。")
+            with st.form("reset_form"):
+                target_email = st.text_input("リセット対象のメールアドレス")
+                new_pwd = st.text_input("新しいパスワード", type="password")
+                if st.form_submit_button("パスワードをリセット"):
+                    if target_email and new_pwd:
+                        if admin_reset_password(target_email, new_pwd):
+                            st.success(f"{target_email} のパスワードを更新しました。")
+                        else: st.error("更新に失敗しました。メールアドレスが正しいか確認してください。")
+                    else: st.error("全ての項目を入力してください。")
+        return
+
+    # --- [ダッシュボード画面] ---
+    st.title(f"📝 note分析ダッシュボード (v7 {db_type.capitalize()})")
+    default_email, default_pw = get_default_credentials()
 
     note_email = st.sidebar.text_input("noteメールアドレス", value=default_email)
     note_password = st.sidebar.text_input("noteパスワード", type="password", value=default_pw)
@@ -283,7 +354,7 @@ def main():
             fig_total.update_layout(xaxis_type='date', yaxis=dict(tickformat=',d', rangemode='tozero'))
             st.plotly_chart(fig_total, use_container_width=True)
 
-        tab1, tab2, tab3 = st.tabs(["📊 累計", "🔥 本日の伸び", "📈 生データ"])
+        tab1, tab2, tab3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
         with tab1:
             fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h', text_auto=True)
             fig.update_layout(yaxis={'autorange': 'reversed'}, height=600)
