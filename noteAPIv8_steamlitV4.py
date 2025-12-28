@@ -50,14 +50,18 @@ def neon_auth_login(email, password):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        # パスワード照合SQL
-        query = "SELECT email FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
+        # パスワードと承認フラグをチェック
+        query = "SELECT email, is_approved FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
         cursor.execute(query, (email, password))
         result = cursor.fetchone()
         conn.close()
         
         if result:
-            return True, "logged_in"
+            email_res, is_approved = result
+            if is_approved:
+                return True, "logged_in"
+            else:
+                return False, "⚠️ あなたのアカウントは現在承認待ちです。管理者の承認後に利用可能になります。"
         else:
             return False, "メールアドレスまたはパスワードが正しくありません。"
     except Exception as e:
@@ -71,18 +75,16 @@ def neon_auth_signup(email, password):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        
-        # 重複チェック
         cursor.execute("SELECT 1 FROM app_users WHERE email = %s", (email,))
         if cursor.fetchone():
             conn.close()
             return False, "このメールアドレスは既に登録されています。"
         
-        # 登録実行
+        # is_approvedはデフォルトでFALSE
         cursor.execute("INSERT INTO app_users (email, password_hash) VALUES (%s, crypt(%s, gen_salt('bf')))", (email, password))
         conn.commit()
         conn.close()
-        return True, "登録が完了しました。ログインタブからログインしてください。"
+        return True, "登録申請を受け付けました。管理者が承認するまでお待ちください。"
     except Exception as e:
         return False, f"登録エラー: {str(e)}"
 
@@ -91,19 +93,45 @@ def admin_get_all_users():
     """全ユーザーのリストを取得（管理者用）"""
     try:
         conn = get_connection()
-        df = pd.read_sql("SELECT email, created_at FROM app_users ORDER BY created_at DESC", conn)
+        df = pd.read_sql("SELECT email, is_approved, created_at FROM app_users ORDER BY created_at DESC", conn)
         conn.close()
         return df
     except Exception as e:
         st.error(f"管理者エラー (UserList): {e}")
         return pd.DataFrame()
 
+def admin_approve_user(email):
+    """ユーザーを承認する（管理者用）"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE app_users SET is_approved = TRUE WHERE email = %s", (email,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"承認エラー: {e}")
+        return False
+
+def admin_delete_user(email):
+    """ユーザーとそのデータを完全に削除する（管理者用）"""
+    try:
+        user_id = hashlib.sha256(email.encode()).hexdigest()[:16]
+        conn = get_connection()
+        cursor = conn.cursor()
+        # 1. noteデータの削除
+        cursor.execute("DELETE FROM article_stats WHERE user_id = %s", (user_id,))
+        # 2. ユーザーアカウントの削除
+        cursor.execute("DELETE FROM app_users WHERE email = %s", (email,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"削除エラー: {e}")
+        return False
+
 def admin_reset_password(email, new_password):
     """指定したユーザーのパスワードをリセット（管理者用）"""
-    db_type, _ = get_db_info()
-    if db_type != "postgres":
-        st.error("パスワードリセットはCloud版でのみ利用可能です。")
-        return False
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -113,7 +141,7 @@ def admin_reset_password(email, new_password):
         conn.close()
         return success
     except Exception as e:
-        st.error(f"管理者エラー (Reset): {e}")
+        st.error(f"パスワードリセットエラー: {e}")
         return False
 
 def get_current_user_id(note_email):
@@ -231,11 +259,11 @@ def main():
         
         with tab_signup:
             with st.form("signup_form"):
-                st.write("新しくアカウントを作成します。")
+                st.write("✨ 月額100円で分析ツールを利用できます。まずは登録申請を行ってください。")
                 new_email = st.text_input("メールアドレス")
                 new_password = st.text_input("パスワード", type="password")
                 confirm_password = st.text_input("パスワード（確認）", type="password")
-                if st.form_submit_button("新規登録"):
+                if st.form_submit_button("利用申請を送る"):
                     if new_password != confirm_password: st.error("パスワードが一致しません。")
                     elif len(new_password) < 4: st.error("パスワードは4文字以上で設定してください。")
                     else:
@@ -269,28 +297,40 @@ def main():
     # --- [管理者画面] ---
     if choice == "🛠️ 管理者画面":
         st.title("🛠️ 管理者ダッシュボード")
-        st.write("登録済みユーザーの管理を行います。")
-        
-        tab_user_list, tab_reset = st.tabs(["ユーザー一覧", "パスワードリセット"])
+        tab_user_list, tab_actions = st.tabs(["ユーザー管理", "一括操作"])
         
         with tab_user_list:
             users_df = admin_get_all_users()
             if not users_df.empty:
-                st.dataframe(users_df, use_container_width=True)
+                st.write("### 登録済みユーザー")
+                # 承認状態を分かりやすく表示
+                users_df['status'] = users_df['is_approved'].apply(lambda x: "✅ 承認済" if x else "⏳ 承認待ち")
+                st.dataframe(users_df[['email', 'status', 'created_at']], use_container_width=True)
             else:
                 st.write("ユーザーはまだ登録されていません。")
         
-        with tab_reset:
-            st.warning("指定したユーザーのパスワードを強制的に書き換えます。")
-            with st.form("reset_form"):
-                target_email = st.text_input("リセット対象のメールアドレス")
-                new_pwd = st.text_input("新しいパスワード", type="password")
-                if st.form_submit_button("パスワードをリセット"):
-                    if target_email and new_pwd:
-                        if admin_reset_password(target_email, new_pwd):
+        with tab_actions:
+            st.write("### ユーザーの承認・パスワードリセット・削除")
+            with st.form("admin_action_form"):
+                target_email = st.text_input("対象のメールアドレス")
+                action = st.selectbox("操作を選択", ["---", "承認する", "パスワードリセット", "アカウント削除"])
+                new_pwd = st.text_input("新しいパスワード（リセット時のみ）", type="password")
+                
+                if st.form_submit_button("実行"):
+                    if not target_email:
+                        st.error("対象のメールアドレスを入力してください。")
+                    elif action == "承認する":
+                        if admin_approve_user(target_email):
+                            st.success(f"{target_email} を承認しました。")
+                            st.rerun()
+                    elif action == "パスワードリセット":
+                        if new_pwd and admin_reset_password(target_email, new_pwd):
                             st.success(f"{target_email} のパスワードを更新しました。")
-                        else: st.error("更新に失敗しました。メールアドレスが正しいか確認してください。")
-                    else: st.error("全ての項目を入力してください。")
+                        else: st.error("パスワードを入力してください。")
+                    elif action == "アカウント削除":
+                        if admin_delete_user(target_email):
+                            st.success(f"{target_email} とそのデータを完全に削除しました。")
+                            st.rerun()
         return
 
     # --- [ダッシュボード画面] ---
