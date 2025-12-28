@@ -35,4 +35,11 @@ db_inspection_result.txt
 Thumbs.db
 
 # SQL (Keep setup scripts, ignore actual data backups if any)
+
 # sql/setup_neon_auth.sql は雛形なので含める
+
+
+
+# Debug and Test scripts
+
+debug/
