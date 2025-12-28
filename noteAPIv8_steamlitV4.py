@@ -31,27 +31,19 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # 1. データベース接続・環境判別・初期化
 # =========================================================================
 def get_db_info():
-    """環境変数からDBタイプを判別する"""
     db_url = os.getenv("DATABASE_URL")
-    if db_url and HAS_POSTGRES:
-        return "postgres", db_url
-    else:
-        return "sqlite", "note_dashboard.db"
+    if db_url and HAS_POSTGRES: return "postgres", db_url
+    else: return "sqlite", "note_dashboard.db"
 
 def get_connection():
-    """適切なデータベース接続を返す"""
     db_type, db_target = get_db_info()
-    if db_type == "postgres":
-        return psycopg2.connect(db_target)
-    else:
-        return sqlite3.connect(db_target)
+    if db_type == "postgres": return psycopg2.connect(db_target)
+    else: return sqlite3.connect(db_target)
 
 def init_db_schema():
-    """データベースのテーブル構造を自動でセットアップ/更新する"""
     db_type, _ = get_db_info()
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = get_connection(); cursor = conn.cursor()
         if db_type == "postgres":
             cursor.execute('CREATE EXTENSION IF NOT EXISTS pgcrypto;')
             cursor.execute('''
@@ -60,42 +52,22 @@ def init_db_schema():
                     email TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     is_approved BOOLEAN DEFAULT FALSE,
+                    skip_stripe BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             ''')
-            cursor.execute('''
-                DO $$ 
-                BEGIN 
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='app_users' AND column_name='is_approved') THEN
-                        ALTER TABLE app_users ADD COLUMN is_approved BOOLEAN DEFAULT FALSE;
-                    END IF;
-                END $$;
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS article_stats (
-                    user_id TEXT, acquired_at TEXT, article_id BIGINT, title TEXT,
-                    views INTEGER, likes INTEGER, comments INTEGER,
-                    PRIMARY KEY (user_id, acquired_at, article_id)
-                );
-            ''')
+            # カラム追加マイグレーション
+            cols = ["is_approved", "skip_stripe"]
+            for col in cols:
+                cursor.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='app_users' AND column_name='{col}') THEN ALTER TABLE app_users ADD COLUMN {col} BOOLEAN DEFAULT FALSE; END IF; END $$;")
+            cursor.execute('CREATE TABLE IF NOT EXISTS article_stats (user_id TEXT, acquired_at TEXT, article_id BIGINT, title TEXT, views INTEGER, likes INTEGER, comments INTEGER, PRIMARY KEY (user_id, acquired_at, article_id));')
         else:
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS article_stats (
-                    user_id TEXT, acquired_at TEXT, article_id INTEGER, title TEXT,
-                    views INTEGER, likes INTEGER, comments INTEGER,
-                    PRIMARY KEY (user_id, acquired_at, article_id)
-                );
-            ''')
-        conn.commit()
-        conn.close()
+            cursor.execute('CREATE TABLE IF NOT EXISTS article_stats (user_id TEXT, acquired_at TEXT, article_id INTEGER, title TEXT, views INTEGER, likes INTEGER, comments INTEGER, PRIMARY KEY (user_id, acquired_at, article_id));')
+        conn.commit(); conn.close()
     except Exception: pass
 
 def check_stripe_subscription(email):
-    """
-    Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認。
-    管理者(ADMIN_EMAIL)は常にTrueを返す。
-    """
-    if email == os.getenv("ADMIN_EMAIL"): return True
+    """Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認"""
     if not stripe.api_key: return True
     try:
         customers = stripe.Customer.list(email=email, limit=1).data
@@ -103,79 +75,74 @@ def check_stripe_subscription(email):
         customer_id = customers[0].id
         subs = stripe.Subscription.list(customer=customer_id, status='all', limit=5).data
         for sub in subs:
+            # active（支払い中）または trialling（無料トライアル中）なら有効
             if sub.status in ['active', 'trialling']: return True
         return False
     except Exception: return False
 
 def neon_auth_login(email, password):
-    """ログイン認証を行い、Stripeの最新状況を反映させる"""
+    """ログイン認証。Stripe自動同期。"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return True, "local"
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        query = "SELECT email, is_approved FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
+        conn = get_connection(); cursor = conn.cursor()
+        query = "SELECT email, is_approved, skip_stripe FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
         cursor.execute(query, (email, password))
         result = cursor.fetchone()
         
         if result:
-            email_res, current_approved = result
-            # ログイン時にStripeと同期（強制チェック）
-            is_currently_paid = check_stripe_subscription(email)
+            email_res, current_approved, skip_stripe = result
             
-            if is_currently_paid != current_approved:
-                cursor.execute("UPDATE app_users SET is_approved = %s WHERE email = %s", (is_currently_paid, email))
+            # --- 判定ロジック ---
+            if skip_stripe:
+                # 管理者または特例ユーザー：Stripeチェックなしで許可
+                access_allowed = True
+            else:
+                # 一般ユーザー：Stripeの最新状況を確認
+                access_allowed = check_stripe_subscription(email)
+            
+            # データベースの状態を最新に同期
+            if access_allowed != current_approved:
+                cursor.execute("UPDATE app_users SET is_approved = %s WHERE email = %s", (access_allowed, email))
                 conn.commit()
-                current_approved = is_currently_paid
             
             conn.close()
-            if current_approved: return True, "logged_in"
+            if access_allowed: return True, "logged_in"
             else:
-                payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
-                return False, f"⚠️ サブスクリプションが有効ではありません。[こちらの決済リンク]({payment_link}) から再開、または決済を完了させてください。"
+                p_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
+                return False, f"⚠️ サブスクリプションが有効ではありません。[こちらの決済リンク]({p_link}) から決済を完了させてください。クーポンをお持ちの方もリンク先で入力可能です。"
         else:
             conn.close()
             return False, "メールアドレスまたはパスワードが正しくありません。"
     except Exception as e: return False, f"認証エラー: {str(e)}"
 
 def neon_auth_signup(email, password):
-    """新規ユーザー登録"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return False, "Local mode doesn't support signup."
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = get_connection(); cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM app_users WHERE email = %s", (email,))
         if cursor.fetchone():
-            conn.close()
-            return False, "このメールアドレスは既に登録されています。"
+            conn.close(); return False, "このメールアドレスは既に登録されています。"
         cursor.execute("INSERT INTO app_users (email, password_hash) VALUES (%s, crypt(%s, gen_salt('bf')))", (email, password))
-        conn.commit()
-        conn.close()
-        payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
-        return True, f"✅ 登録完了！[こちらから決済]({payment_link}) を完了させてください。クーポン `FREE30` 等も利用可能です。完了後にログイン可能になります。"
+        conn.commit(); conn.close()
+        p_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
+        return True, f"✅ 登録完了！[決済リンク]({p_link}) から決済を完了させてください。クーポン `FREE30` 等も利用可能です。完了後にログイン可能になります。"
     except Exception as e: return False, f"登録エラー: {str(e)}"
 
-# --- 管理者メニュー機能 ---
+# --- 管理者専用 ---
 def admin_get_all_users():
     try:
-        conn = get_connection(); df = pd.read_sql("SELECT email, is_approved, created_at FROM app_users ORDER BY created_at DESC", conn); conn.close()
+        conn = get_connection(); df = pd.read_sql("SELECT email, is_approved, skip_stripe, created_at FROM app_users ORDER BY created_at DESC", conn); conn.close()
         return df
     except Exception: return pd.DataFrame()
 
-def admin_approve_user(email):
-    """手動承認（Stripe未決済でも許可する場合などに使用）"""
+def admin_toggle_skip_stripe(email, value):
+    """Stripeチェックをスキップするかどうかの切り替え"""
     try:
         conn = get_connection(); cursor = conn.cursor()
-        cursor.execute("UPDATE app_users SET is_approved = TRUE WHERE email = %s", (email,)); conn.commit(); conn.close()
-        return True
-    except Exception: return False
-
-def admin_revoke_user(email):
-    """承認解除（未承認に戻す）"""
-    try:
-        conn = get_connection(); cursor = conn.cursor()
-        cursor.execute("UPDATE app_users SET is_approved = FALSE WHERE email = %s", (email,)); conn.commit(); conn.close()
+        cursor.execute("UPDATE app_users SET skip_stripe = %s, is_approved = %s WHERE email = %s", (value, value, email))
+        conn.commit(); conn.close()
         return True
     except Exception: return False
 
@@ -221,7 +188,7 @@ def note_auth(session, email, password):
     except Exception: return None
 
 # =========================================================================
-# 2. データ操作
+# 2. データ取得・表示
 # =========================================================================
 def get_articles(session, user_id):
     articles = []; tdy = datetime.now().strftime('%Y-%m-%d'); page = 1
@@ -259,15 +226,15 @@ def main():
 
     if db_type == "postgres" and not st.session_state.app_auth_token:
         st.title("🛡️ note分析アプリ ログイン")
-        tab_l, tab_s = st.tabs(["ログイン", "新規利用登録"])
-        with tab_l:
+        t_l, t_s = st.tabs(["ログイン", "新規利用登録"])
+        with t_l:
             with st.form("login"):
                 e = st.text_input("メールアドレス"); p = st.text_input("パスワード", type="password")
                 if st.form_submit_button("ログイン"):
                     ok, res = neon_auth_login(e, p)
                     if ok: st.session_state.app_auth_token=res; st.session_state.app_user_email=e; st.rerun()
                     else: st.error(res)
-        with tab_s:
+        with t_s:
             st.write("✨ 月額300円のプレミアムツールです。1ヶ月無料クーポン `FREE30` 配信中！")
             with st.form("signup"):
                 ne = st.text_input("メールアドレス"); np = st.text_input("パスワード", type="password"); cp = st.text_input("パスワード(確認)", type="password")
@@ -283,7 +250,7 @@ def main():
         st.sidebar.info(f"👤 {st.session_state.app_user_email}")
         if st.sidebar.button("ログアウト"): st.session_state.app_auth_token=None; st.session_state.app_user_email=None; st.rerun()
 
-    menu = ["ダッシュボード"]; 
+    menu = ["ダッシュボード"]
     if is_admin: menu.append("🛠️ 管理者画面")
     choice = st.sidebar.radio("メニュー", menu)
 
@@ -293,14 +260,15 @@ def main():
         with t1:
             df = admin_get_all_users()
             if not df.empty:
-                df['status'] = df['is_approved'].apply(lambda x: "✅ 承認済" if x else "⏳ 承認待ち")
-                st.dataframe(df[['email', 'status', 'created_at']], use_container_width=True)
+                df['status'] = df['is_approved'].apply(lambda x: "✅ 許可済" if x else "⏳ 未決済/停止中")
+                df['type'] = df['skip_stripe'].apply(lambda x: "⭐ 特例(Stripe免除)" if x else "💳 一般")
+                st.dataframe(df[['email', 'status', 'type', 'created_at']], use_container_width=True)
         with t2:
             with st.form("admin_act"):
-                te = st.text_input("対象メール"); act = st.selectbox("操作", ["---", "承認する", "承認を解除する", "パスワードリセット", "アカウント削除"]); pw = st.text_input("新パスワード", type="password")
+                te = st.text_input("対象メール"); act = st.selectbox("操作", ["---", "特例として許可(Stripe免除)", "一般ユーザーに戻す", "パスワードリセット", "アカウント削除"]); pw = st.text_input("新パスワード", type="password")
                 if st.form_submit_button("実行"):
-                    if act == "承認する": admin_approve_user(te)
-                    elif act == "承認を解除する": admin_revoke_user(te)
+                    if act == "特例として許可(Stripe免除)": admin_toggle_skip_stripe(te, True)
+                    elif act == "一般ユーザーに戻す": admin_toggle_skip_stripe(te, False)
                     elif act == "パスワードリセット": admin_reset_password(te, pw)
                     elif act == "アカウント削除": admin_delete_user(te)
                     st.rerun()
@@ -308,7 +276,6 @@ def main():
 
     st.title("📝 note分析ダッシュボード")
     de, dp = get_default_credentials(); ne = st.sidebar.text_input("noteメールアドレス", value=de); np = st.sidebar.text_input("noteパスワード", type="password", value=dp); uid = get_current_user_id(ne)
-    
     if st.sidebar.button("最新データを取得する"):
         s = requests.session()
         if note_auth(s, ne, np):
@@ -327,7 +294,6 @@ def main():
         if has_prev:
             df_p = df_all[df_all['acquired_at'] == ud[-2]]; df_m = pd.merge(df_latest[['article_id', 'title', 'views']], df_p[['article_id', 'views']], on='article_id', suffixes=('', '_prev'), how='left').fillna(0)
             df_m['views_delta'] = df_m['views'] - df_m['views_prev']; vd = int(df_m['views_delta'].sum()); df_d = df_m.sort_values('views_delta', ascending=False)
-
         st.info(f"最終更新: {latest.strftime('%Y-%m-%d %H:%M')}")
         c1, c2, c3 = st.columns(3); c1.metric("公開記事数", f"{len(df_latest)} 記事"); c2.metric("累計ビュー", f"{df_latest['views'].sum():,}", delta=f"+{vd:,}" if has_prev else None); c3.metric("累計スキ", f"{df_latest['likes'].sum():,}")
         st.markdown("---")
@@ -344,8 +310,7 @@ def main():
         st.markdown("---")
         if has_prev:
             st.subheader("📊 個別ビュー数推移")
-            ps = df_all[['acquired_at', 'title', 'views']].drop_duplicates(['acquired_at', 'title']); pdf = ps.pivot(index='acquired_at', columns='title', values='views')
-            fig = go.Figure()
+            ps = df_all[['acquired_at', 'title', 'views']].drop_duplicates(['acquired_at', 'title']); pdf = ps.pivot(index='acquired_at', columns='title', values='views'); fig = go.Figure()
             for t in pdf.columns: fig.add_trace(go.Scatter(x=pdf.index, y=pdf[t], mode='lines', name=t, connectgaps=True))
             fig.update_layout(hovermode='closest', showlegend=False, height=700, xaxis_type='date', yaxis=dict(tickformat=',d')); st.plotly_chart(fig, use_container_width=True)
         if db_type == "sqlite":
