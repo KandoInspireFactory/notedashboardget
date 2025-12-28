@@ -91,7 +91,10 @@ def init_db_schema():
     except Exception: pass
 
 def check_stripe_subscription(email):
-    """Stripe APIを呼び出し、有効なサブスクリプションを確認"""
+    """
+    Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認。
+    管理者(ADMIN_EMAIL)は常にTrueを返す。
+    """
     if email == os.getenv("ADMIN_EMAIL"): return True
     if not stripe.api_key: return True
     try:
@@ -117,11 +120,14 @@ def neon_auth_login(email, password):
         
         if result:
             email_res, current_approved = result
+            # ログイン時にStripeと同期（強制チェック）
             is_currently_paid = check_stripe_subscription(email)
+            
             if is_currently_paid != current_approved:
                 cursor.execute("UPDATE app_users SET is_approved = %s WHERE email = %s", (is_currently_paid, email))
                 conn.commit()
                 current_approved = is_currently_paid
+            
             conn.close()
             if current_approved: return True, "logged_in"
             else:
@@ -147,10 +153,10 @@ def neon_auth_signup(email, password):
         conn.commit()
         conn.close()
         payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
-        return True, f"✅ 登録完了！[こちらから決済]({payment_link}) を完了させてください。クーポン `FREE30` (初月無料) 等も利用可能です。完了後にログイン可能になります。"
+        return True, f"✅ 登録完了！[こちらから決済]({payment_link}) を完了させてください。クーポン `FREE30` 等も利用可能です。完了後にログイン可能になります。"
     except Exception as e: return False, f"登録エラー: {str(e)}"
 
-# --- 管理者メニュー ---
+# --- 管理者メニュー機能 ---
 def admin_get_all_users():
     try:
         conn = get_connection(); df = pd.read_sql("SELECT email, is_approved, created_at FROM app_users ORDER BY created_at DESC", conn); conn.close()
@@ -158,9 +164,18 @@ def admin_get_all_users():
     except Exception: return pd.DataFrame()
 
 def admin_approve_user(email):
+    """手動承認（Stripe未決済でも許可する場合などに使用）"""
     try:
         conn = get_connection(); cursor = conn.cursor()
         cursor.execute("UPDATE app_users SET is_approved = TRUE WHERE email = %s", (email,)); conn.commit(); conn.close()
+        return True
+    except Exception: return False
+
+def admin_revoke_user(email):
+    """承認解除（未承認に戻す）"""
+    try:
+        conn = get_connection(); cursor = conn.cursor()
+        cursor.execute("UPDATE app_users SET is_approved = FALSE WHERE email = %s", (email,)); conn.commit(); conn.close()
         return True
     except Exception: return False
 
@@ -206,7 +221,7 @@ def note_auth(session, email, password):
     except Exception: return None
 
 # =========================================================================
-# 2. データ取得・表示
+# 2. データ操作
 # =========================================================================
 def get_articles(session, user_id):
     articles = []; tdy = datetime.now().strftime('%Y-%m-%d'); page = 1
@@ -259,10 +274,7 @@ def main():
                 if st.form_submit_button("利用申請を送る"):
                     if np != cp: st.error("パスワード不一致")
                     elif len(np)<4: st.error("4文字以上必要")
-                    else: 
-                        ok, msg = neon_auth_signup(ne, np)
-                        if ok: st.info(msg) # ここを st.info に修正して戻り値を表示させない
-                        else: st.error(msg)
+                    else: ok, msg = neon_auth_signup(ne, np); st.info(msg) if ok else st.error(msg)
         return
 
     is_admin = (st.session_state.app_user_email == os.getenv("ADMIN_EMAIL")) if os.getenv("ADMIN_EMAIL") else False
@@ -285,9 +297,10 @@ def main():
                 st.dataframe(df[['email', 'status', 'created_at']], use_container_width=True)
         with t2:
             with st.form("admin_act"):
-                te = st.text_input("対象メール"); act = st.selectbox("操作", ["---", "承認する", "パスワードリセット", "アカウント削除"]); pw = st.text_input("新パスワード", type="password")
+                te = st.text_input("対象メール"); act = st.selectbox("操作", ["---", "承認する", "承認を解除する", "パスワードリセット", "アカウント削除"]); pw = st.text_input("新パスワード", type="password")
                 if st.form_submit_button("実行"):
                     if act == "承認する": admin_approve_user(te)
+                    elif act == "承認を解除する": admin_revoke_user(te)
                     elif act == "パスワードリセット": admin_reset_password(te, pw)
                     elif act == "アカウント削除": admin_delete_user(te)
                     st.rerun()
