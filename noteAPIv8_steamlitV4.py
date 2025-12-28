@@ -45,14 +45,12 @@ def get_connection():
 def get_neon_api_url(endpoint):
     """
     環境変数 NEON_DATA_API_URL を元に正しいAPIエンドポイントを構築する。
-    末尾の /v1 などの重複を防止する。
     """
     base_url = os.getenv("NEON_DATA_API_URL", "").rstrip("/")
-    # base_urlが /v1 で終わっている場合は、それを除去して構築
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-    
-    return f"{base_url}/v1/rpc/{endpoint}"
+    # 既に /rpc が含まれている場合は endpoint を足さない
+    if "/rpc/" in base_url:
+        return base_url
+    return f"{base_url}/rpc/{endpoint}"
 
 def neon_auth_login(email, password):
     """Neon Data APIを使用してログイン認証を行う"""
@@ -61,9 +59,14 @@ def neon_auth_login(email, password):
     
     if not api_key: return True, "local"
     try:
+        # Authorizationヘッダーではなく Neon-Api-Key ヘッダーを使用する
+        headers = {
+            "Neon-Api-Key": api_key,
+            "Content-Type": "application/json"
+        }
         response = requests.post(
             url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             json={"email": email, "password": password},
             timeout=10
         )
@@ -83,20 +86,28 @@ def neon_auth_signup(email, password):
     url = get_neon_api_url("sign_up")
     
     try:
+        # Authorizationヘッダーではなく Neon-Api-Key ヘッダーを使用する
+        headers = {
+            "Neon-Api-Key": api_key,
+            "Content-Type": "application/json"
+        }
         response = requests.post(
             url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             json={"email": email, "password": password},
             timeout=10
         )
         if response.status_code == 200:
             res_data = response.json()
+            # 戻り値がリスト形式で返ってくる場合があるため対応
+            if isinstance(res_data, list) and len(res_data) > 0:
+                res_data = res_data[0]
+                
             if res_data.get("status") == "success":
                 return True, "登録が完了しました。ログインタブからログインしてください。"
             else:
                 return False, res_data.get("message", "登録に失敗しました。")
         else:
-            # エラーの詳細を解析
             try:
                 err_msg = response.json().get("message", response.text)
             except:
