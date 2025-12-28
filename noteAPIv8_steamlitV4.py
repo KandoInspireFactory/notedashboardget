@@ -91,10 +91,7 @@ def init_db_schema():
     except Exception: pass
 
 def check_stripe_subscription(email):
-    """
-    Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認。
-    管理者(ADMIN_EMAIL)は常にTrueを返す。
-    """
+    """Stripe APIを呼び出し、有効なサブスクリプションを確認"""
     if email == os.getenv("ADMIN_EMAIL"): return True
     if not stripe.api_key: return True
     try:
@@ -103,7 +100,6 @@ def check_stripe_subscription(email):
         customer_id = customers[0].id
         subs = stripe.Subscription.list(customer=customer_id, status='all', limit=5).data
         for sub in subs:
-            # active（支払い済み）または trialling（クーポンによる無料期間）ならOK
             if sub.status in ['active', 'trialling']: return True
         return False
     except Exception: return False
@@ -121,21 +117,13 @@ def neon_auth_login(email, password):
         
         if result:
             email_res, current_approved = result
-            
-            # --- サブスク状況の同期チェック ---
-            # ログインのたびにStripeを確認し、DBの状態を最新に保つ
             is_currently_paid = check_stripe_subscription(email)
-            
             if is_currently_paid != current_approved:
-                # Stripeの状態とDBの状態が食い違っていれば更新
                 cursor.execute("UPDATE app_users SET is_approved = %s WHERE email = %s", (is_currently_paid, email))
                 conn.commit()
                 current_approved = is_currently_paid
-            
             conn.close()
-            
-            if current_approved:
-                return True, "logged_in"
+            if current_approved: return True, "logged_in"
             else:
                 payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
                 return False, f"⚠️ サブスクリプションが有効ではありません。[こちらの決済リンク]({payment_link}) から再開、または決済を完了させてください。"
@@ -218,7 +206,7 @@ def note_auth(session, email, password):
     except Exception: return None
 
 # =========================================================================
-# 2. データ取得・保存
+# 2. データ取得・表示
 # =========================================================================
 def get_articles(session, user_id):
     articles = []; tdy = datetime.now().strftime('%Y-%m-%d'); page = 1
@@ -271,7 +259,10 @@ def main():
                 if st.form_submit_button("利用申請を送る"):
                     if np != cp: st.error("パスワード不一致")
                     elif len(np)<4: st.error("4文字以上必要")
-                    else: ok, msg = neon_auth_signup(ne, np); st.markdown(msg) if ok else st.error(msg)
+                    else: 
+                        ok, msg = neon_auth_signup(ne, np)
+                        if ok: st.info(msg) # ここを st.info に修正して戻り値を表示させない
+                        else: st.error(msg)
         return
 
     is_admin = (st.session_state.app_user_email == os.getenv("ADMIN_EMAIL")) if os.getenv("ADMIN_EMAIL") else False
@@ -340,7 +331,8 @@ def main():
         st.markdown("---")
         if has_prev:
             st.subheader("📊 個別ビュー数推移")
-            ps = df_all[['acquired_at', 'title', 'views']].drop_duplicates(['acquired_at', 'title']); pdf = ps.pivot(index='acquired_at', columns='title', values='views'); fig = go.Figure()
+            ps = df_all[['acquired_at', 'title', 'views']].drop_duplicates(['acquired_at', 'title']); pdf = ps.pivot(index='acquired_at', columns='title', values='views')
+            fig = go.Figure()
             for t in pdf.columns: fig.add_trace(go.Scatter(x=pdf.index, y=pdf[t], mode='lines', name=t, connectgaps=True))
             fig.update_layout(hovermode='closest', showlegend=False, height=700, xaxis_type='date', yaxis=dict(tickformat=',d')); st.plotly_chart(fig, use_container_width=True)
         if db_type == "sqlite":
