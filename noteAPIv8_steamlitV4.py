@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
+import stripe
 
 # Optional: PostgreSQL support
 try:
@@ -22,6 +23,9 @@ except ImportError:
 
 # .envファイルを読み込む
 load_dotenv()
+
+# Stripeの設定
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # =========================================================================
 # 1. データベース接続・環境判別・認証
@@ -42,27 +46,69 @@ def get_connection():
     else:
         return sqlite3.connect(db_target)
 
+def check_stripe_subscription(email):
+    """
+    Stripe APIを呼び出し、ユーザーが有効なサブスクリプションを持っているか確認する。
+    クーポン使用によるトライアル中（trialling）も有効とみなす。
+    """
+    if not stripe.api_key:
+        # APIキーがない場合はチェックをスキップ（開発用）
+        return True
+
+    try:
+        # メールアドレスで顧客を検索
+        customers = stripe.Customer.list(email=email, limit=1).data
+        if not customers:
+            return False
+        
+        customer_id = customers[0].id
+        # 有効なサブスクリプションを検索（active または trialling）
+        subscriptions = stripe.Subscription.list(
+            customer=customer_id, 
+            status='all', 
+            limit=5
+        ).data
+        
+        for sub in subscriptions:
+            if sub.status in ['active', 'trialling']:
+                return True
+        return False
+    except Exception as e:
+        st.error(f"Stripe確認エラー: {e}")
+        return False
+
 def neon_auth_login(email, password):
-    """直接DB接続を使用してログイン認証を行う"""
+    """ログイン認証を行い、必要に応じてStripeで支払状況を自動更新する"""
     db_type, _ = get_db_info()
     if db_type != "postgres": return True, "local"
     
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        # パスワードと承認フラグをチェック
         query = "SELECT email, is_approved FROM app_users WHERE email = %s AND password_hash = crypt(%s, password_hash)"
         cursor.execute(query, (email, password))
         result = cursor.fetchone()
-        conn.close()
         
         if result:
             email_res, is_approved = result
+            
+            # もし未承認（is_approved=False）なら、Stripeを確認しに行く
+            if not is_approved:
+                if check_stripe_subscription(email):
+                    # 支払いが確認できたので自動承認
+                    cursor.execute("UPDATE app_users SET is_approved = TRUE WHERE email = %s", (email,))
+                    conn.commit()
+                    is_approved = True
+            
+            conn.close()
+            
             if is_approved:
                 return True, "logged_in"
             else:
-                return False, "⚠️ あなたのアカウントは現在承認待ちです。管理者の承認後に利用可能になります。"
+                payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
+                return False, f"⚠️ 支払いが確認できていないか、承認待ちです。 [こちらから決済を完了させてください]({payment_link}) 完了後、再度ログインしてください。クーポンをお持ちの方もリンク先で入力可能です。"
         else:
+            conn.close()
             return False, "メールアドレスまたはパスワードが正しくありません。"
     except Exception as e:
         return False, f"認証エラー: {str(e)}"
@@ -80,11 +126,12 @@ def neon_auth_signup(email, password):
             conn.close()
             return False, "このメールアドレスは既に登録されています。"
         
-        # is_approvedはデフォルトでFALSE
         cursor.execute("INSERT INTO app_users (email, password_hash) VALUES (%s, crypt(%s, gen_salt('bf')))", (email, password))
         conn.commit()
         conn.close()
-        return True, "登録申請を受け付けました。管理者が承認するまでお待ちください。"
+        
+        payment_link = os.getenv("STRIPE_PAYMENT_LINK", "#")
+        return True, f"アカウントを作成しました！ [こちらのリンク]({payment_link}) から決済（月額100円）を完了させてからログインしてください。1ヶ月無料クーポン等をお持ちの方も同じリンクから適用できます。"
     except Exception as e:
         return False, f"登録エラー: {str(e)}"
 
@@ -119,9 +166,7 @@ def admin_delete_user(email):
         user_id = hashlib.sha256(email.encode()).hexdigest()[:16]
         conn = get_connection()
         cursor = conn.cursor()
-        # 1. noteデータの削除
         cursor.execute("DELETE FROM article_stats WHERE user_id = %s", (user_id,))
-        # 2. ユーザーアカウントの削除
         cursor.execute("DELETE FROM app_users WHERE email = %s", (email,))
         conn.commit()
         conn.close()
@@ -239,7 +284,7 @@ def main():
     if "app_auth_token" not in st.session_state: st.session_state.app_auth_token = None
     if "app_user_email" not in st.session_state: st.session_state.app_user_email = None
 
-    # --- アプリログイン（Neon Auth） ---
+    # --- アプリログイン（Neon Auth + Stripe自動承認） ---
     if db_type == "postgres" and not st.session_state.app_auth_token:
         st.title("🛡️ note分析アプリ ログイン")
         tab_login, tab_signup = st.tabs(["ログイン", "新規登録"])
@@ -255,11 +300,12 @@ def main():
                         st.session_state.app_user_email = email
                         st.success("ログイン成功！")
                         st.rerun()
-                    else: st.error(result)
+                    else:
+                        st.error(result)
         
         with tab_signup:
             with st.form("signup_form"):
-                st.write("✨ 月額100円で分析ツールを利用できます。まずは登録申請を行ってください。")
+                st.write("✨ 月額100円で分析ツールを利用できます（クーポン利用可能）。")
                 new_email = st.text_input("メールアドレス")
                 new_password = st.text_input("パスワード", type="password")
                 confirm_password = st.text_input("パスワード（確認）", type="password")
@@ -268,7 +314,7 @@ def main():
                     elif len(new_password) < 4: st.error("パスワードは4文字以上で設定してください。")
                     else:
                         success, message = neon_auth_signup(new_email, new_password)
-                        if success: st.success(message)
+                        if success: st.markdown(message)
                         else: st.error(message)
         return
 
@@ -303,7 +349,6 @@ def main():
             users_df = admin_get_all_users()
             if not users_df.empty:
                 st.write("### 登録済みユーザー")
-                # 承認状態を分かりやすく表示
                 users_df['status'] = users_df['is_approved'].apply(lambda x: "✅ 承認済" if x else "⏳ 承認待ち")
                 st.dataframe(users_df[['email', 'status', 'created_at']], use_container_width=True)
             else:
