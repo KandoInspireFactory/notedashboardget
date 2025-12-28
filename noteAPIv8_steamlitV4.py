@@ -6,6 +6,7 @@ import csv
 from datetime import datetime
 import os
 import sqlite3
+import hashlib
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -23,7 +24,7 @@ except ImportError:
 load_dotenv()
 
 # =========================================================================
-# 1. データベース接続・環境判別
+# 1. データベース接続・環境判別・認証
 # =========================================================================
 def get_db_info():
     """環境変数からDBタイプを判別する"""
@@ -40,6 +41,43 @@ def get_connection():
         return psycopg2.connect(db_target)
     else:
         return sqlite3.connect(db_target)
+
+def neon_auth_login(email, password):
+    """Neon Data APIを使用してログイン認証を行う"""
+    data_api_url = os.getenv("NEON_DATA_API_URL")
+    api_key = os.getenv("NEON_API_KEY")
+    
+    if not data_api_url or not api_key:
+        # 設定がない場合は認証スキップ（ローカル配布版など）
+        return True, "local"
+
+    try:
+        # Perplexityの調査結果に基づいたRPC呼び出し
+        response = requests.post(
+            f"{data_api_url}/v1/rpc/sign_in",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"email": email, "password": password},
+            timeout=10
+        )
+        if response.status_code == 200:
+            return True, response.json().get("token", "logged_in")
+        else:
+            return False, "ログイン失敗: メールアドレスまたはパスワードが正しくありません。"
+    except Exception as e:
+        return False, f"認証エラー: {str(e)}"
+
+def get_current_user_id(note_email):
+    """
+    ユーザーIDを取得する。
+    アプリログイン済みの場合はそのメールを、
+    ローカル実行時はnoteのメールアドレスのハッシュを使用する。
+    """
+    # アプリ認証済みのメールを優先
+    email = st.session_state.get("app_user_email", note_email)
+    
+    if not email:
+        return "guest"
+    return hashlib.sha256(email.encode()).hexdigest()[:16]
 
 def get_default_credentials():
     """Secrets または環境変数からデフォルトのメールとパスワードを取得する"""
@@ -66,17 +104,17 @@ def note_auth(session, email_address, password):
         r.raise_for_status()
         res_json = r.json()
         if "error" in res_json:
-            st.error(f"ログインエラー: {res_json.get('error', '不明なエラー')}")
+            st.error(f"noteログインエラー: {res_json.get('error', '不明なエラー')}")
             return None
         return session
     except Exception:
-        st.error("認証中にエラーが発生しました。メールアドレスとパスワードを確認してください。")
+        st.error("noteの認証中にエラーが発生しました。メールアドレスとパスワードを確認してください。")
         return None
 
 # =========================================================================
 # 2. データ取得ロジック
 # =========================================================================
-def get_articles(session):
+def get_articles(session, user_id):
     """noteの統計APIから記事データを全件取得する"""
     articles = []
     tdy = datetime.now().strftime('%Y-%m-%d')
@@ -103,6 +141,7 @@ def get_articles(session):
             name = item.get('name')
             if name:
                 articles.append((
+                    user_id,
                     tdy, 
                     item.get('id'), 
                     name, 
@@ -133,26 +172,26 @@ def save_data(articles_data, save_dir):
         if db_type == "postgres":
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS article_stats (
-                    acquired_at TEXT, article_id BIGINT, title TEXT,
+                    user_id TEXT, acquired_at TEXT, article_id BIGINT, title TEXT,
                     views INTEGER, likes INTEGER, comments INTEGER,
-                    PRIMARY KEY (acquired_at, article_id)
+                    PRIMARY KEY (user_id, acquired_at, article_id)
                 )
             ''')
             insert_query = """
-                INSERT INTO article_stats (acquired_at, article_id, title, views, likes, comments)
-                VALUES %s ON CONFLICT (acquired_at, article_id) DO NOTHING
+                INSERT INTO article_stats (user_id, acquired_at, article_id, title, views, likes, comments)
+                VALUES %s ON CONFLICT (user_id, acquired_at, article_id) DO NOTHING
             """
             execute_values(cursor, insert_query, articles_data)
         else:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS article_stats (
-                    acquired_at TEXT, article_id INTEGER, title TEXT,
+                    user_id TEXT, acquired_at TEXT, article_id INTEGER, title TEXT,
                     views INTEGER, likes INTEGER, comments INTEGER,
-                    PRIMARY KEY (acquired_at, article_id)
+                    PRIMARY KEY (user_id, acquired_at, article_id)
                 )
             ''')
             cursor.executemany(
-                'INSERT OR IGNORE INTO article_stats VALUES (?, ?, ?, ?, ?, ?)', 
+                'INSERT OR IGNORE INTO article_stats VALUES (?, ?, ?, ?, ?, ?, ?)', 
                 articles_data
             )
         
@@ -164,7 +203,7 @@ def save_data(articles_data, save_dir):
     # CSV保存 (履歴用)
     today_str = datetime.now().strftime('%Y%m%d')
     csv_path = os.path.join(save_dir, f'noteList_{today_str}.csv')
-    df = pd.DataFrame(articles_data, columns=['acquired_at', 'article_id', 'title', 'views', 'likes', 'comments'])
+    df = pd.DataFrame(articles_data, columns=['user_id', 'acquired_at', 'article_id', 'title', 'views', 'likes', 'comments'])
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     
     return db_type, csv_path
@@ -175,23 +214,61 @@ def save_data(articles_data, save_dir):
 def main():
     db_type, _ = get_db_info()
     st.set_page_config(page_title=f"note分析 v7 ({db_type.capitalize()})", layout="wide")
+
+    # セッション状態の初期化
+    if "app_auth_token" not in st.session_state:
+        st.session_state.app_auth_token = None
+    if "app_user_email" not in st.session_state:
+        st.session_state.app_user_email = None
+
+    # --- アプリログイン（Neon Auth） ---
+    # NEON_API_KEYがある場合のみ強制
+    if db_type == "postgres" and os.getenv("NEON_API_KEY") and not st.session_state.app_auth_token:
+        st.title("🛡️ アプリログイン")
+        with st.form("app_login"):
+            st.write("このアプリを利用するにはログインが必要です。")
+            app_email = st.text_input("メールアドレス")
+            app_password = st.text_input("パスワード", type="password")
+            submit = st.form_submit_button("ログイン")
+            
+            if submit:
+                success, result = neon_auth_login(app_email, app_password)
+                if success:
+                    st.session_state.app_auth_token = result
+                    st.session_state.app_user_email = app_email
+                    st.success("ログインしました。")
+                    st.rerun()
+                else:
+                    st.error(result)
+        return # ログインしていない場合はここで停止
+
+    # --- メインダッシュボード ---
     st.title(f"📝 note分析ダッシュボード (v7 {db_type.capitalize()})")
     
     default_email, default_pw = get_default_credentials()
 
-    st.sidebar.header("🔑 取得設定")
-    email = st.sidebar.text_input("メールアドレス", value=default_email)
-    password = st.sidebar.text_input("パスワード", type="password", value=default_pw)
+    # サイドバー: 取得設定
+    st.sidebar.header("🔑 note取得設定")
+    if st.session_state.app_user_email:
+        st.sidebar.info(f"ログインユーザー: {st.session_state.app_user_email}")
+        if st.sidebar.button("ログアウト"):
+            st.session_state.app_auth_token = None
+            st.session_state.app_user_email = None
+            st.rerun()
+
+    note_email = st.sidebar.text_input("noteメールアドレス", value=default_email)
+    note_password = st.sidebar.text_input("noteパスワード", type="password", value=default_pw)
     
+    current_user_id = get_current_user_id(note_email)
     save_dir = "note_data"
     
     if st.sidebar.button("最新データを取得する"):
-        if not email or not password:
-            st.sidebar.error("ログイン情報を入力してください。")
+        if not note_email or not note_password:
+            st.sidebar.error("noteのログイン情報を入力してください。")
         else:
             session = requests.session()
-            if note_auth(session, email, password):
-                data = get_articles(session)
+            if note_auth(session, note_email, note_password):
+                data = get_articles(session, current_user_id)
                 if data:
                     res_db_type, _ = save_data(data, save_dir)
                     st.sidebar.success(f"データの更新に成功しました！ ({res_db_type})")
@@ -200,10 +277,14 @@ def main():
                 else:
                     st.sidebar.warning("記事が見つかりませんでした。")
 
-    # データ表示
+    # データ表示 (現在のユーザーのものに限定)
     try:
         conn = get_connection()
-        df_all = pd.read_sql('SELECT * FROM article_stats', conn)
+        if db_type == "postgres":
+            query = "SELECT * FROM article_stats WHERE user_id = %s"
+        else:
+            query = "SELECT * FROM article_stats WHERE user_id = ?"
+        df_all = pd.read_sql(query, conn, params=(current_user_id,))
         conn.close()
     except Exception:
         df_all = pd.DataFrame()
@@ -251,7 +332,7 @@ def main():
             fig_total.update_layout(xaxis_type='date', yaxis=dict(tickformat=',d', rangemode='tozero'))
             st.plotly_chart(fig_total, use_container_width=True)
         else:
-            st.info("📉 推移を表示するには、2日分以上のデータが必要です。明日また最新データを取得してください。")
+            st.info("📉 推移グラフを表示するには、2日分以上のデータが必要です。明日また最新データを取得してください。")
 
         st.markdown("---")
         tab1, tab2, tab3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
