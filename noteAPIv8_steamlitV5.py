@@ -557,8 +557,22 @@ def main():
             pdf = ps.pivot(index='acquired_at', columns='title', values='views')
             fig = go.Figure()
             for t in pdf.columns:
-                fig.add_trace(go.Scatter(x=pdf.index, y=pdf[t], mode='lines', name=t, connectgaps=True))
-            fig.update_layout(hovermode='closest', showlegend=False, height=700, xaxis_type='date', yaxis=dict(tickformat=',d'))
+                fig.add_trace(go.Scatter(x=pdf.index, y=pdf[t], mode='lines+markers', name=t, connectgaps=True))
+            
+            fig.update_layout(
+                hovermode='closest', # マウスに一番近い記事だけを表示
+                showlegend=False,    # 凡例は非表示
+                height=700, 
+                xaxis_type='date', 
+                yaxis=dict(tickformat=',d'),
+                margin=dict(l=10, r=10, t=10, b=10)
+            )
+            # ホバーラベルのタイトルを全文表示する設定
+            fig.update_traces(
+                hoverlabel=dict(namelength=-1, font_size=12), # タイトル全文表示
+                mode='lines' # マーカーは消してスッキリさせる
+            ) 
+            
             st.plotly_chart(fig, use_container_width=True)
             
     else:
