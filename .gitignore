@@ -1,3 +1,10 @@
+# Project specific
+log/
+docs/
+sql/
+note_data/
+debug/
+
 # Python
 __pycache__/
 *.py[cod]
