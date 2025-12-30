@@ -4,6 +4,7 @@ docs/
 sql/
 note_data/
 debug/
+article_drafts/
 
 # Python
 __pycache__/
