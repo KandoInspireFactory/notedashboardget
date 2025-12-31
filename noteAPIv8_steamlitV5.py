@@ -152,6 +152,14 @@ def admin_delete_user(email):
         return True
     except Exception: return False
 
+def admin_update_skip_stripe(email, skip_stripe_value):
+    try:
+        conn = get_connection(); cursor = conn.cursor()
+        cursor.execute("UPDATE app_users SET skip_stripe = %s, is_approved = %s WHERE email = %s", (skip_stripe_value, skip_stripe_value, email))
+        conn.commit(); conn.close()
+        return True
+    except Exception: return False
+
 def get_current_user_id(note_email):
     email = st.session_state.get("app_user_email", note_email)
     if not email: return "guest"
@@ -387,8 +395,22 @@ def main():
         st.title("🛠️ 管理者画面")
         df = admin_get_all_users()
         if not df.empty:
-            df['status'] = df['is_approved'].apply(lambda x: "✅ 許可済" if x else "⏳ 未決済/停止中")
-            st.dataframe(df[['email', 'status', 'created_at']], use_container_width=True)
+            st.subheader("ユーザー一覧・権限設定")
+            for index, row in df.iterrows():
+                c1, c2 = st.columns([3, 1])
+                status_icon = "👑 永久許可" if row['skip_stripe'] else ("✅ 決済済" if row['is_approved'] else "⏳ 未決済")
+                with c1:
+                    st.write(f"**{row['email']}**")
+                    st.caption(f"Status: {status_icon} | Created: {row['created_at']}")
+                with c2:
+                    if row['skip_stripe']:
+                        if st.button("永久許可を解除", key=f"rev_{index}"):
+                            if admin_update_skip_stripe(row['email'], False): st.success("解除しました"); st.rerun()
+                    else:
+                        if st.button("永久許可を与える", key=f"grant_{index}"):
+                            if admin_update_skip_stripe(row['email'], True): st.success("許可しました"); st.rerun()
+                st.divider()
+
             with st.expander("🗑️ アカウントの削除"):
                 te = st.text_input("削除するメールアドレス")
                 if st.button("完全に削除する"):
@@ -531,6 +553,7 @@ def main():
         else:
             st.info("📉 推移グラフを表示するには、2日分以上のデータが必要です。")
 
+        st.subheader("📊 記事別累計ビューランキング (TOP 20)")
         t1, t2, t3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
         with t1:
             fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h', text_auto=True)
