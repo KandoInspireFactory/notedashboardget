@@ -529,17 +529,24 @@ def main():
         df_latest = df_all[df_all['acquired_at'] == latest].sort_values('views', ascending=False)
         
         has_prev = len(ud) >= 2
-        vd = 0
+        vd = 0; ld = 0; ad = 0
         if has_prev:
             df_p = df_all[df_all['acquired_at'] == ud[-2]]
-            df_m = pd.merge(df_latest[['article_id', 'views']], df_p[['article_id', 'views']], on='article_id', suffixes=('', '_prev'), how='left').fillna(0)
+            df_m = pd.merge(df_latest[['article_id', 'views', 'likes']], df_p[['article_id', 'views', 'likes']], on='article_id', suffixes=('', '_prev'), how='left').fillna(0)
             vd = int((df_m['views'] - df_m['views_prev']).sum())
+            ld = int((df_m['likes'] - df_m['likes_prev']).sum())
+            ad = int(len(df_latest) - len(df_p))
 
         st.info(f"最終更新: {latest.strftime('%Y-%m-%d')}")
         c1, c2, c3 = st.columns(3)
-        c1.metric("公開記事数", f"{len(df_latest)} 記事")
-        c2.metric("累計ビュー", f"{df_latest['views'].sum():,}", delta=f"+{vd:,}" if has_prev else None)
-        c3.metric("累計スキ", f"{df_latest['likes'].sum():,}")
+        
+        ad_txt = f"+{ad}" if ad > 0 else (f"{ad}" if ad < 0 else None)
+        vd_txt = f"+{vd:,}" if vd > 0 else (f"{vd:,}" if vd < 0 else None)
+        ld_txt = f"+{ld:,}" if ld > 0 else (f"{ld:,}" if ld < 0 else None)
+
+        c1.metric("公開記事数", f"{len(df_latest)} 記事", delta=ad_txt)
+        c2.metric("累計ビュー", f"{df_latest['views'].sum():,}", delta=vd_txt)
+        c3.metric("累計スキ", f"{df_latest['likes'].sum():,}", delta=ld_txt)
         
         st.markdown("---")
         
@@ -556,7 +563,7 @@ def main():
         st.subheader("📊 記事別累計ビューランキング (TOP 20)")
         t1, t2, t3 = st.tabs(["📊 累計ランキング", "🔥 本日の伸び", "📈 生データ"])
         with t1:
-            fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h', text_auto=True)
+            fig = px.bar(df_latest.head(20), x='views', y='title', orientation='h', text_auto=',d')
             fig.update_layout(yaxis={'autorange': 'reversed'}, height=600)
             st.plotly_chart(fig, use_container_width=True)
         with t2:
@@ -565,7 +572,7 @@ def main():
                 df_m = pd.merge(df_latest[['article_id', 'title', 'views']], df_p[['article_id', 'views']], on='article_id', suffixes=('', '_prev'), how='left').fillna(0)
                 df_m['views_delta'] = df_m['views'] - df_m['views_prev']
                 df_d = df_m.sort_values('views_delta', ascending=False)
-                fig = px.bar(df_d.head(20), x='views_delta', y='title', orientation='h', text_auto=True)
+                fig = px.bar(df_d.head(20), x='views_delta', y='title', orientation='h', text_auto=',d')
                 fig.update_layout(yaxis={'autorange': 'reversed'}, height=600)
                 st.plotly_chart(fig, use_container_width=True)
             else:
@@ -580,7 +587,7 @@ def main():
             pdf = ps.pivot(index='acquired_at', columns='title', values='views')
             fig = go.Figure()
             for t in pdf.columns:
-                fig.add_trace(go.Scatter(x=pdf.index, y=pdf[t], mode='lines+markers', name=t, connectgaps=True))
+                fig.add_trace(go.Scatter(x=pdf.index, y=pdf[t], mode='lines', name=t, connectgaps=True))
             
             fig.update_layout(
                 hovermode='closest', # マウスに一番近い記事だけを表示
@@ -592,8 +599,7 @@ def main():
             )
             # ホバーラベルのタイトルを全文表示する設定
             fig.update_traces(
-                hoverlabel=dict(namelength=-1, font_size=12), # タイトル全文表示
-                mode='lines' # マーカーは消してスッキリさせる
+                hoverlabel=dict(namelength=-1, font_size=12) # タイトル全文表示
             ) 
             
             st.plotly_chart(fig, use_container_width=True)
