@@ -13,6 +13,16 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 import stripe
 import io
+import time
+
+# 2026/02/27 認証仕様変更への対応
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Origin': 'https://note.com',
+    'Referer': 'https://note.com/login'
+}
 
 # Optional: PostgreSQL support
 try:
@@ -177,9 +187,21 @@ def get_default_credentials():
 
 def note_auth(session, email, password):
     try:
-        r = session.post('https://note.com/api/v1/sessions/sign_in', json={"login": email, "password": password})
-        if "error" in r.json(): return None
-        return session
+        # 1. 初期Cookie取得
+        session.get('https://note.com/login', headers=DEFAULT_HEADERS)
+        time.sleep(1)
+
+        # 2. ログイン実行
+        r = session.post('https://note.com/api/v1/sessions/sign_in', json={"login": email, "password": password}, headers=DEFAULT_HEADERS)
+        
+        try:
+            r2 = r.json()
+        except json.JSONDecodeError:
+            return None
+
+        if r.status_code in [200, 201] and "data" in r2:
+            return session
+        return None
     except Exception: return None
 
 # =========================================================================
@@ -191,7 +213,7 @@ def get_articles(session, user_id):
     while True:
         txt.text(f"ページ {page} 取得中...")
         try:
-            r = session.get(f'https://note.com/api/v1/stats/pv?filter=all&page={page}&sort=pv')
+            r = session.get(f'https://note.com/api/v1/stats/pv?filter=all&page={page}&sort=pv', headers=DEFAULT_HEADERS)
             data = r.json(); stats = data.get('data', {}).get('note_stats', [])
             if not stats: break
             for item in stats:
