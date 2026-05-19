@@ -1,10 +1,16 @@
 # Project specific
 log/
-docs/
 sql/
 note_data/
 debug/
 article_drafts/
+
+# PyInstaller / Build outputs
+build/
+dist/
+dist2/*.exe
+*.exe
+*.spec
 
 # Python
 __pycache__/
